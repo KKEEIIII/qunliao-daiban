@@ -84,3 +84,5 @@ todos.json（待办清单）
 ---
 
 下载见 [Releases](../../releases)。
+
+> **本仓库只包含脚本与文档。** MaaFramework 运行库（约 90MB 二进制，LGPL-3.0）和完整部署包不打进 git，见 [Releases](../../releases)。
