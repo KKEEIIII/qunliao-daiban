@@ -1,0 +1,6 @@
+{
+  "collectMinutes": 60,
+  "remindMinutes": 5,
+  "selfcheckMinutes": 120,
+  "_note": "三个计划任务的周期（分钟）。用 群聊待办\\控制台.ps1 改（生成页面 → 改 → 导出改动 → -Apply 应用），自检.ps1 的\"日志陈旧\"阈值跟着它走，别只改任务不改这里。"
+}

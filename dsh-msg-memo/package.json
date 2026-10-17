@@ -1,0 +1,23 @@
+{
+  "name": "@local/dsh-msg-memo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 插件：定时读微信截图采集器写的 spool，用 DSH 的 LLM 抽出待办，生成 群聊待办/todos.json 与 MEMO.md",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "config.json",
+    "prompt-extra.txt"
+  ]
+}

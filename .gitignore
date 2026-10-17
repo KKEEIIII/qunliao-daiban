@@ -1,0 +1,25 @@
+# ---- 个人数据：不要提交（仓库里只有"脱敏模板"） ----
+群聊待办/todos.json
+群聊待办/MEMO.md
+群聊待办/插件日志.txt
+群聊待办/reminder-state.json
+群聊待办/*.bak-*
+wx-采集器/logs/
+wx-采集器/spool/
+wx-采集器/state/
+wx-采集器/shots/
+wx-采集器/*.bak-*
+dsh-接入/logs/
+dsh-接入/运行状态.json
+dsh-接入/*.bak-*
+# ---- 运行库 / 构建产物 / 发版产物 ----
+maafw-probe/maa/
+发布/_旧包/
+发布/_作废/
+发布/_staging/
+发布/_github-src/
+发布/*.zip
+发布/*-校验清单.md
+node_modules/
+*.log
+*.tmp

@@ -1,0 +1,22 @@
+{
+  "fixture": "wechat-list.json",
+  "minSessions": 6,
+  "mustContain": [
+    "人工智能",
+    "理综",
+    "212",
+    "人工"
+  ],
+  "mustNotBeName": [
+    "0"
+  ],
+  "note": "fixture 是 2026-10-14 07:36 从真实微信窗口（894x647）导出的 OCR 快照；改 parser 后跑 测试-解析.ps1 验证",
+  "maxSessions": 6,
+  "exactNames": [
+    "人工智能",
+    "理综",
+    "212",
+    "人工",
+    "养"
+  ]
+}

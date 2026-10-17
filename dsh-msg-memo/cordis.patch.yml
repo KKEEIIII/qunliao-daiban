@@ -1,0 +1,4 @@
+# dsh-msg-memo 的装载层：把插件行插进 profile 的插件树
+- insert:
+    - id: dsh-msg-memo
+      name: '@local/dsh-msg-memo'

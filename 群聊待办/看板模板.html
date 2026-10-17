@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>群聊待办看板</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --line:#e3e6ea; --text:#1f2328; --dim:#6b7280; --accent:#2f6feb; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 120px; background:var(--bg); color:var(--text);
+         font:15px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px; }
+  h2 { font-size:16px; margin:26px 0 10px; display:flex; align-items:center; gap:8px; }
+  h2 .n { color:var(--dim); font-weight:400; font-size:13px; }
+  .item { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:12px 14px; margin-bottom:8px; display:flex; gap:12px; align-items:flex-start; }
+  .item.changed { border-color:var(--accent); box-shadow:0 0 0 2px rgba(47,111,235,.12); }
+  .item.done .t { text-decoration: line-through; color:var(--dim); }
+  input[type=checkbox] { width:18px; height:18px; margin-top:3px; flex:0 0 auto; cursor:pointer; }
+  .body { flex:1 1 auto; min-width:0; }
+  .t { font-weight:600; }
+  .meta { color:var(--dim); font-size:12.5px; margin-top:2px; word-break:break-all; }
+  .why { color:#3d4450; font-size:13px; margin-top:6px; padding-left:8px; border-left:3px solid var(--line); }
+  .ev { color:#8a9099; font-size:12.5px; margin-top:4px; white-space:pre-wrap; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:99px; font-size:11.5px;
+          border:1px solid var(--line); color:var(--dim); margin-right:6px; }
+  .pill.overdue { color:#b42318; border-color:#f4c7c3; background:#fef3f2; }
+  .pill.today { color:#b54708; border-color:#f7d9a8; background:#fffaeb; }
+  .pill.confirm { color:#6941c6; border-color:#ddd0fb; background:#f6f3ff; }
+  .acts { flex:0 0 auto; display:flex; flex-direction:column; gap:6px; }
+  .acts button { font-size:12px; padding:3px 8px; border:1px solid var(--line); background:#fff;
+                 border-radius:6px; color:var(--dim); cursor:pointer; }
+  .acts button:hover { color:var(--text); border-color:#c9ced6; }
+  .bar { position:fixed; left:0; right:0; bottom:0; background:#1f2328; color:#fff;
+         padding:12px 16px; display:flex; gap:14px; align-items:center; justify-content:center;
+         font-size:14px; }
+  .bar button { font-size:14px; padding:6px 14px; border-radius:8px; border:0; cursor:pointer;
+                background:var(--accent); color:#fff; }
+  .bar button.ghost { background:transparent; border:1px solid #5a6270; color:#d7dbe0; }
+  .bar.hidden { display:none; }
+  .empty { color:var(--dim); background:var(--card); border:1px dashed var(--line);
+           border-radius:10px; padding:14px; }
+  details summary { cursor:pointer; color:var(--dim); font-size:13px; }
+  /* 2026-10-16：橙色提示条（服务停了 / 本页过期 / 不是从服务打开时用） */
+  .warnbox { background:#fff6e5; border:1px solid #f0dcb0; color:#7a4d00; border-radius:10px;
+             padding:12px 14px; margin-bottom:12px; font-size:13.5px; line-height:1.75; }
+  .warnbox.off { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="banner" class="warnbox off"></div>
+  <h1>群聊待办看板</h1>
+  <div class="sub">
+    数据来自 <code>群聊待办/todos.json</code>（生成于 <span id="gen">-</span>）·
+    勾选后点右下角「<b>确定</b>」→ <b>立刻写回</b>（不用下载文件、不用敲命令；写回后自动关页 + 自动停服务）
+  </div>
+  <div id="app"></div>
+</div>
+
+<div class="bar hidden" id="bar">
+  <span id="barText">-</span>
+  <button id="export">确定</button>
+  <button class="ghost" id="reset">放弃改动</button>
+  <button class="ghost" id="stopSrv" style="display:none">停止服务</button>
+  <span id="acWrap" style="display:none;font-size:12.5px;color:#c9ced6"><label style="cursor:pointer"><input type="checkbox" id="autoclose" checked style="vertical-align:-2px"> 写回后自动关页并停服务（想连着改多项就取消勾选）</label></span>
+</div>
+
+<script id="todo-data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  var el = document.getElementById('todo-data');
+  // 用 TextDecoder 解 base64 里的 UTF-8：避免中文在 file:// 下的编码坑
+  var data = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(el.textContent.trim()), function (c) { return c.charCodeAt(0); })));
+  var items = data.items || [];
+  document.getElementById('gen').textContent = data.generatedAt || '-';
+
+  // 页面上的改动只存在内存里：{ id: 'done' | 'ignored' | 'open' }
+  var pending = {};
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function today0() { var d = new Date(); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+  function dueDate(it) { return it.due ? new Date(it.due) : null; }
+  function isValid(d) { return d && !isNaN(d.getTime()); }
+
+  function bucketOf(it) {
+    var st = String(it.status || 'open');
+    if (st === 'done' || st === 'ignored' || st === 'expired') return 'closed';
+    if (st === 'pending_confirm' || (typeof it.confidence === 'number' && it.confidence < 0.6)) return 'confirm';
+    var d = dueDate(it);
+    if (!isValid(d)) return 'later';
+    var t0 = today0();
+    if (d < t0) return 'overdue';
+    if (d < new Date(t0.getTime() + 86400000)) return 'today';
+    if (d < new Date(t0.getTime() + 7 * 86400000)) return 'week';
+    return 'later';
+  }
+  var ORDER = [['overdue', '❗ 逾期'], ['today', '⏰ 今天'], ['week', '📅 本周'], ['later', '🗓 以后'], ['confirm', '❓ 待确认'], ['closed', '✅ 已完成/已忽略']];
+  var LABEL = { overdue: '逾期', today: '今天', week: '本周', later: '以后', confirm: '待确认', closed: '已关闭' };
+
+  function when(it) {
+    var d = dueDate(it);
+    if (!isValid(d)) return '';
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function render() {
+    var app = document.getElementById('app');
+    app.textContent = '';
+    var groups = {};
+    ORDER.forEach(function (o) { groups[o[0]] = []; });
+    items.forEach(function (it) { groups[bucketOf(it)].push(it); });
+
+    var shown = 0;
+    ORDER.forEach(function (o) {
+      var key = o[0], list = groups[key];
+      if (!list.length) return;
+      var h = document.createElement('h2');
+      h.appendChild(document.createTextNode(o[1]));
+      var n = document.createElement('span'); n.className = 'n'; n.textContent = '（' + list.length + '）';
+      h.appendChild(n);
+      app.appendChild(h);
+
+      list.slice().sort(function (a, b) {
+        var da = dueDate(a), db = dueDate(b);
+        var ta = isValid(da) ? da.getTime() : Infinity, tb = isValid(db) ? db.getTime() : Infinity;
+        return ta - tb;
+      }).forEach(function (it) {
+        shown++;
+        var eff = pending[it.id] || String(it.status || 'open');
+        var closedEff = eff === 'done' || eff === 'ignored';
+        var div = document.createElement('div');
+        div.className = 'item' + (pending[it.id] ? ' changed' : '') + (closedEff ? ' done' : '');
+
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = closedEff;
+        cb.title = '勾选 = 标记完成；取消勾选 = 重新打开';
+        cb.addEventListener('change', function () {
+          if (cb.checked) pending[it.id] = 'done';
+          else if (String(it.status) === 'done' || String(it.status) === 'ignored') pending[it.id] = 'open';
+          else delete pending[it.id];
+          syncBar(); render();
+        });
+        div.appendChild(cb);
+
+        var body = document.createElement('div'); body.className = 'body';
+        var t = document.createElement('div'); t.className = 't'; t.textContent = it.title || '(无标题)';
+        body.appendChild(t);
+
+        var pills = document.createElement('div'); pills.className = 'meta';
+        var b = bucketOf(Object.assign({}, it, { status: eff }));
+        var p1 = document.createElement('span'); p1.className = 'pill ' + b; p1.textContent = LABEL[b];
+        pills.appendChild(p1);
+        var w = when(it);
+        if (w) { var p2 = document.createElement('span'); p2.className = 'pill'; p2.textContent = w; pills.appendChild(p2); }
+        if (typeof it.confidence === 'number') {
+          var p3 = document.createElement('span'); p3.className = 'pill'; p3.textContent = '置信 ' + it.confidence;
+          pills.appendChild(p3);
+        }
+        pills.appendChild(document.createTextNode((it.source && it.source.chat ? '｜ ' + it.source.chat : '') +
+          (it.source && it.source.sender ? ' · ' + it.source.sender : '')));
+        body.appendChild(pills);
+
+        if (it.reason) {
+          var why = document.createElement('div'); why.className = 'why';
+          why.textContent = '为什么是待办：' + it.reason;
+          body.appendChild(why);
+        }
+        if (it.evidence) {
+          var det = document.createElement('details');
+          var sum = document.createElement('summary'); sum.textContent = '原文（evidence）';
+          det.appendChild(sum);
+          var ev = document.createElement('div'); ev.className = 'ev'; ev.textContent = it.evidence;
+          det.appendChild(ev);
+          body.appendChild(det);
+        }
+        if (it.ignoredNote) {
+          var nt = document.createElement('div'); nt.className = 'meta'; nt.textContent = '备注：' + it.ignoredNote;
+          body.appendChild(nt);
+        }
+        div.appendChild(body);
+
+        var acts = document.createElement('div'); acts.className = 'acts';
+        var bIgn = document.createElement('button'); bIgn.textContent = '忽略';
+        bIgn.addEventListener('click', function () { pending[it.id] = 'ignored'; syncBar(); render(); });
+        var bRe = document.createElement('button'); bRe.textContent = '重新打开';
+        bRe.addEventListener('click', function () {
+          if (String(it.status) === 'open') delete pending[it.id]; else pending[it.id] = 'open';
+          syncBar(); render();
+        });
+        acts.appendChild(bIgn); acts.appendChild(bRe);
+        div.appendChild(acts);
+
+        app.appendChild(div);
+      });
+    });
+    if (!shown) {
+      var e = document.createElement('div'); e.className = 'empty'; e.textContent = '没有待办。';
+      app.appendChild(e);
+    }
+  }
+
+  function syncBar() {
+    var ids = Object.keys(pending);
+    var bar = document.getElementById('bar');
+    if (!ids.length) { bar.className = 'bar hidden'; return; }
+    bar.className = 'bar';
+    var map = { done: '完成', ignored: '忽略', open: '重新打开' };
+    document.getElementById('barText').textContent = '有 ' + ids.length + ' 处改动待导出（' +
+      ids.slice(0, 4).map(function (id) { return map[pending[id]] || pending[id]; }).join('、') +
+      (ids.length > 4 ? ' …' : '') + '）';
+  }
+
+  document.getElementById('reset').addEventListener('click', function () { pending = {}; syncBar(); render(); });
+  // ⚠️ 2026-10-16 与控制台页对齐（用户反馈"点按钮没反应"）：
+  // ⚠️ 2026-10-16 用户要求：**看板也只保留"点确定即写回"**（本地服务版）。
+  //   原来那套"下载 看板改动-*.json → 再自己跑 -Apply"的文件模式已经删掉，别再往回加。
+  var TOKEN = '';
+  try { TOKEN = new URLSearchParams(location.search).get('t') || ''; } catch (e) { TOKEN = ''; }
+  var SERVER = (location.protocol === 'http:' || location.protocol === 'https:') && !!TOKEN;
+  var serviceDead = false;
+  var staleMarked = false;
+  function showBanner(html) {
+    var b = document.getElementById('banner');
+    if (!b) { return; }
+    b.className = 'warnbox';
+    b.innerHTML = html;
+  }
+  function markDead() {
+    if (serviceDead) { return; }
+    serviceDead = true;
+    showBanner('<b>⚠️ 本地看板服务已停止 —— 这一页现在不能写回了</b><br>'
+      + '常见原因：上次写回完成后自动停止了（默认行为）/ 空闲 30 分钟自动退出 / 手动点了「停止服务」。<br>'
+      + '<b>恢复</b>：双击 <code>群聊待办/打开看板.cmd</code>，会重新打开一个能写回的页面。这一页直接关掉即可。');
+    setBarText('⚠️ 本地服务已停止 —— 请双击 群聊待办/打开看板.cmd 重新打开');
+  }
+  function markStale() {
+    if (staleMarked) { return; }
+    staleMarked = true;
+    showBanner('<b>⚠️ 这一页是上一次打开的看板，已经失效了 —— 请关掉它</b><br>'
+      + '原因：看板服务重新启动过，token 换了；这一页点「确定」不会生效。<br>'
+      + '<b>怎么办</b>：按 Ctrl+W 关掉这一页，用最新打开的那个；或双击 <code>群聊待办/打开看板.cmd</code> 重开。');
+    setBarText('⚠️ 这是旧的页签（token 已失效）—— 关掉它就行');
+    try { window.close(); } catch (e) { }
+    setTimeout(function () { try { window.close(); } catch (e) { } }, 500);
+  }
+  function pingService() {
+    return fetch('ping?t=' + TOKEN).then(function (r) {
+      if (!r.ok) { markDead(); return false }
+      return r.json().then(function (j) {
+        if (j && j.ok === true && j.tokenOk === false) { markStale(); return false }
+        return true
+      }).catch(function () { return true })
+    }).catch(function () { markDead(); return false })
+  }
+  function localStamp() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '-' + p(d.getHours()) + '-' + p(d.getMinutes()) + '-' + p(d.getSeconds());
+  }
+  function setBarText(t) { document.getElementById('barText').textContent = t; }
+
+  if (SERVER) {
+    document.body.className = 'server';
+    var stopBtn = document.getElementById('stopSrv');
+    stopBtn.style.display = 'inline-block';
+    stopBtn.addEventListener('click', function () {
+      setBarText('正在停止本地服务……');
+      fetch('quit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) })
+        .then(function () { setBarText('本地服务已停止；要再写回，双击 群聊待办/打开看板.cmd 重新打开'); })
+        .catch(function () { setBarText('停止请求失败（服务可能已经退出了）'); });
+    });
+    var acWrap = document.getElementById('acWrap');
+    var acBox = document.getElementById('autoclose');
+    acWrap.style.display = 'inline-block';
+    try { if (localStorage.getItem('boardAutoclose') === '0') { acBox.checked = false; } } catch (e) { }
+    acBox.addEventListener('change', function () {
+      try { localStorage.setItem('boardAutoclose', acBox.checked ? '1' : '0'); } catch (e) { }
+      setBarText(acBox.checked ? '已开启：写回后自动关页并停服务' : '已关闭：写回后页面留着，可以接着改');
+    });
+    pingService();
+    setInterval(pingService, 5 * 60 * 1000);
+  } else {
+    showBanner('<b>⚠️ 这一页不是从本地服务打开的 —— 文件模式（下载 JSON 补丁）已停用</b><br>'
+      + '请双击 <code>群聊待办/打开看板.cmd</code> 打开看板（它会起本地服务、自动打开能"点确定即写回"的页面）。');
+    setBarText('⚠️ 请用 群聊待办/打开看板.cmd 打开（文件模式已停用）');
+  }
+
+  document.getElementById('export').addEventListener('click', function () {
+    var changes = Object.keys(pending).map(function (id) { return { id: id, status: pending[id] }; });
+    if (changes.length === 0) { setBarText('还没有改动 —— 先勾选任意一条待办，再点「确定」'); return; }
+    if (!SERVER) { setBarText('⚠️ 文件模式已停用 —— 请用 群聊待办/打开看板.cmd 打开看板'); return; }
+    if (serviceDead || staleMarked) { setBarText('⚠️ 本地服务已停止/本页已过期 —— 请双击 群聊待办/打开看板.cmd 重新打开'); return; }
+    var patch = { kind: 'todo-board-changes', version: 1, exportedAt: new Date().toISOString(), changes: changes };
+    setBarText('正在写回本机……（' + changes.length + ' 处改动，这一小会儿别关窗口）');
+    fetch('apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN, patch: patch })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j && j.ok) {
+        var acOn = document.getElementById('autoclose').checked;
+        if (acOn) {
+          setBarText('✅ 已写回 ' + (j.changes || changes.length) + ' 处改动 —— 2 秒后自动关闭本页并停止服务');
+          setTimeout(function () {
+            fetch('quit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) }).catch(function () { });
+            setTimeout(function () { try { window.close(); } catch (e) { } }, 400);
+            setTimeout(function () {
+              showBanner('<b>✅ 已经写回完成，本地服务也已停止</b><br>'
+                + '浏览器不允许网页自己关掉这个标签页（它不是由脚本打开的）—— 手动关掉这一页即可。<br>'
+                + '想再看/再改：双击 <code>群聊待办/打开看板.cmd</code> 重新打开。');
+              setBarText('✅ 已写回完成、服务已停止 —— 手动关掉这个页签就行');
+            }, 1300);
+          }, 2000);
+        } else {
+          setBarText('✅ 已写回 ' + (j.changes || changes.length) + ' 处改动 —— 页面马上刷新（服务继续运行，可以接着改）');
+          setTimeout(function () { location.reload(); }, 1600);
+        }
+      } else {
+        var why = (j && (j.error || ('退出码 ' + j.code))) || '未知原因';
+        setBarText('❌ 写回失败：' + why + ' —— 可以再点一次「确定」重试；仍不行就关掉页面、双击 打开看板.cmd 重开');
+      }
+    }).catch(function (e) {
+      markDead();
+      setBarText('❌ 连不上本地服务（' + e.message + '）—— 请双击 群聊待办/打开看板.cmd 重新打开');
+    });
+  });
+
+  render();
+  syncBar();
+})();
+</script>
+</body>
+</html>

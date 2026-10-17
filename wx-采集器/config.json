@@ -1,0 +1,55 @@
+{
+  "sessionXFrom": 0.1,
+  "sessionXTo": 0.42,
+  "chatXFrom": 0.42,
+  "headerYTo": 0.16,
+  "rowGap": 35,
+  "clickX": 0.25,
+  "clickSettleMs": 1100,
+  "ignoreChats": [
+    "公众号",
+    "服务号",
+    "订阅号",
+    "折叠的聊天",
+    "折叠的群聊",
+    "微信团队",
+    "QQ邮箱提醒",
+    "微信支付",
+    "文件传输助手",
+    "群助手",
+    "服务通知",
+    "订阅号消息"
+  ],
+  "maxPreviewLen": 200,
+  "scale": 3,
+  "groupWhitelist": [],
+  "mentionOnly": true,
+  "myAliases": [],
+  "restoreIfMinimized": true,
+  "badgePattern": "^\\d+[+Ww]?$",
+  "_notes_badge": "未读角标行的正则（实测会把 17/1/0 读成 O/212/0，还会和群名挤成\"0苎\"）",
+  "nameXFrom": 0.145,
+  "_notes_nameX": "名字列左边界（窗口宽比例）。角标在头像左边 x≈0.06~0.13W，名字在 x≈0.175W 起；用来区分\"纯数字角标\"和\"真的叫 212 的会话\"",
+  "previewPattern": "^[^：:]{2,16}[：:]\\s*\\S",
+  "_notes_preview": "预览行形态（\"发言人：内容\"）。选群名时先排除这类行，避免把预览当群名",
+  "chatRules": [],
+  "_notes_rules": "match 可写字符串或数组（任一命中即可）；匹配是容错的：包含 / 数字前缀(266⊂<示例群号>) / 滑窗编辑距离≤1",
+  "returnToMain": {
+    "enabled": false,
+    "action": "backspace",
+    "click": {
+      "x": 0.03,
+      "y": 0.06
+    },
+    "key": 0
+  },
+  "nonChatMarkers": [
+    "群助手",
+    "服务通知",
+    "订阅号消息",
+    "公众号",
+    "微信团队"
+  ],
+  "_notes_returnToMain": "误入群助手/服务通知这类非聊天界面时怎么退回来。enabled=false 表示不自动返回（只记录并跳过该目标）。action: backspace(连按两次退格) / click(点 click.x,click.y 的窗口比例位置) / clickKey(先点再按 key)。**不要用 esc** —— 实测会让微信窗口隐藏、采集器彻底失明。",
+  "_设置说明": "myAliases：填你自己的微信昵称（用来识别\"@我\"，可多个）。groupWhitelist：要盯的群名（留空=所有会话）。mentionOnly：true=只收提到我的消息。chatRules：按群定制规则，见 使用手册.md"
+}

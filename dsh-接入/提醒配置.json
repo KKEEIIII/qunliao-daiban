@@ -1,0 +1,53 @@
+{
+  "phonePush": {
+    "enabled": true,
+    "aumid": "DSH.Todo",
+    "popupOnReminder": true,
+    "wechat": {
+      "enabled": false,
+      "nodePath": "",
+      "cliPath": "",
+      "_设置说明": "可选：个人微信提醒（腾讯官方 iLink 机器人，装 dsh-wechat-plugin + 扫码绑定后启用）。把 enabled 改 true，nodePath 填机器上 node.exe 的绝对路径、cliPath 填 dsh-wechat-plugin 包里 cli.js 的绝对路径。微信优先、发失败自动回退企业微信。"
+    },
+    "wecom": {
+      "webhook": "",
+      "note": "企业微信 → 建一个群 → 群设置/右上角 → 群机器人 → 添加机器人 → 复制 Webhook 地址，粘到 webhook 字段（形如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx）",
+      "mention": "@all",
+      "_mention_note": "@all = 消息里 @所有人（被 @ 到手机才会弹通知）；填企业微信 userid（多人用逗号分隔）则只 @ 指定人；留空 = 退回 markdown（不弹通知）",
+      "_note2": "手机弹通知靠 mention（默认 @all）：群机器人的普通消息手机端不弹，被 @ 到才弹。",
+      "_设置说明": "企业微信 → 建群 → 群机器人 → 复制 Webhook 粘到这里。mention 保持 @all（这样手机才会弹通知）"
+    },
+    "ntfy": {
+      "topic": "",
+      "_note": "可选备用通道，默认不用"
+    },
+    "dingtalk": {
+      "webhook": "",
+      "keyword": "待办",
+      "note": "钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义(Webhook接入) → 安全设置选\"自定义关键词\"填 待办 → 复制 Webhook 地址"
+    },
+    "email": {
+      "enabled": false,
+      "smtp": "smtp.qq.com",
+      "port": 587,
+      "user": "",
+      "pass": "",
+      "to": ""
+    },
+    "wecomApp": {
+      "enabled": false,
+      "corpid": "",
+      "secret": "",
+      "agentid": "",
+      "touser": "",
+      "_note": "可选：企业微信自建应用（必弹但配置麻烦），不用管"
+    },
+    "qq": {
+      "enabled": true,
+      "note": "QQ 通道（2026-10-17 加）：你在 DSH 里扫码绑定过 QQ 后**自动可用**，不需要再配任何东西。实现见 发QQ.mjs —— 读插件存好的凭据（AppID/AppSecret/userOpenid）直连腾讯官方机器人 API，不经过 AI 回合。不想用就把 enabled 改成 false。注意：腾讯对「主动消息」有频次限制，被限流时会打印 429 并降级到其它通道。",
+      "nodePath": "",
+      "prefer": false,
+      "_preferNote": "默认 false = 微信优先、QQ 兜底；想让 QQ 排在微信前面（比如你主要用 QQ）就改成 true"
+    }
+  }
+}

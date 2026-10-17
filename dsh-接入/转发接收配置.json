@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "server": "https://ntfy.sh",
+  "inboundTopic": "",
+  "notes": "手机端（SmsForwarder / 通知滤盒 / GotMsg 等）把 QQ/微信的通知转发到这个主题；本机定时来拉。inboundTopic 就是密码，别外传。",
+  "filter": {
+    "mode": "mention",
+    "aliases": [],
+    "keywords": [],
+    "chatWhitelist": []
+  },
+  "spoolDir": "wx-采集器/spool",
+  "stateFile": "dsh-接入/logs/转发接收-state.json",
+  "logFile": "dsh-接入/logs/转发接收.log",
+  "maxMessagesPerRun": 50,
+  "aliases": [],
+  "_设置说明": "入站转发（手机通知 → ntfy → 本机）默认停用。要用的话：自己起一个够随机的 inboundTopic 填这里，并在 转发接收配置.json 里把 enabled 改 true（inboundTopic 相当于密码，别用别人的、也别外传）"
+}

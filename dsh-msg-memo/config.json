@@ -1,0 +1,16 @@
+{
+  "workspaceDir": "",
+  "intervalMs": 600000,
+  "firstRunDelayMs": 20000,
+  "provider": "deepseek-account",
+  "model": "deepseek-flash",
+  "maxRecordsPerRun": 40,
+  "timeoutMs": 180000,
+  "prefilter": true,
+  "prefilterLog": "prefilter-dropped.jsonl",
+  "prefilterDumpDropped": true,
+  "note": "intervalMs 默认 10 分钟；provider/model 要和 profile 里 agent-default-model 一致；archiveAfterDays：已完成/已忽略的待办超过这个天数就挪到 群聊待办/archive/（设 0 关闭）；prefilter：本地预筛（false = 全量送模型，老行为）",
+  "archiveAfterDays": 7,
+  "myAliases": [],
+  "_设置说明": "workspaceDir 由安装器自动填。myAliases 要和 wx-采集器/config.json 里的一致（插件用它判断\"这条是不是在点我\"）"
+}
