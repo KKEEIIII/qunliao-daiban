@@ -180,6 +180,24 @@ if (Test-Path -LiteralPath $InstallDir) {
     Say '  → 本次安装会覆盖/修复成无 BOM 版本；装完请**重启 DSH 一次**，插件才会真正装载'
   }
 }
+# 版本提示（2026-10-18）：明确告诉用户"这次是升级到最新版"还是"已是最新"
+$pkgVer = ''
+$pkgVerFile = Join-Path $src '版本.txt'
+if (Test-Path -LiteralPath $pkgVerFile) {
+  $mpv = [regex]::Match([System.IO.File]::ReadAllText($pkgVerFile, [System.Text.Encoding]::UTF8), '(?m)^版本\s*:\s*(\S+)')
+  if ($mpv.Success) { $pkgVer = $mpv.Groups[1].Value.Trim() }
+}
+$oldVer = ''
+$oldVerFile = Join-Path $InstallDir '版本.txt'
+if (Test-Path -LiteralPath $oldVerFile) {
+  $mov = [regex]::Match([System.IO.File]::ReadAllText($oldVerFile, [System.Text.Encoding]::UTF8), '(?m)^版本\s*:\s*(\S+)')
+  if ($mov.Success) { $oldVer = $mov.Groups[1].Value.Trim() }
+}
+if ($pkgVer -and $oldVer -and $oldVer -ne $pkgVer) {
+  Warn ('检测到已安装 ' + $oldVer + '，本次升级到最新版 ' + $pkgVer)
+} elseif ($pkgVer -and $oldVer -eq $pkgVer) {
+  Ok ('本机已是这一版（' + $pkgVer + '）—— 重装会保留你的配置')
+}
 $subs = @('dsh-接入', 'wx-采集器', 'maafw-probe', 'dsh-msg-memo', '群聊待办')
 foreach ($d in $subs) {
   $from = Join-Path $src $d

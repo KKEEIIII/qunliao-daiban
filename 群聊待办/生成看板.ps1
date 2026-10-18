@@ -97,7 +97,20 @@ function New-Board {
   $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payloadJson))
 
   $tpl = [System.IO.File]::ReadAllText($tplPath, [System.Text.Encoding]::UTF8)
-  $outHtml = $tpl.Replace('__DATA__', $b64)
+  # 2026-10-18：版本横幅（读自检写的 群聊待办\最新版本提示.txt；已最新/离线 → 空，不打扰）
+$verbarHtml = ''
+try {
+  $hintP = Join-Path $todoDir '最新版本提示.txt'
+  if (Test-Path -LiteralPath $hintP) {
+    $hl = ([System.IO.File]::ReadAllText($hintP, [System.Text.Encoding]::UTF8)).Trim()
+    $fs = $hl -split '\|'
+    if ($fs.Count -ge 4 -and $fs[0] -eq 'OUTDATED') {
+      $safe = [System.Net.WebUtility]::HtmlEncode($fs[3])
+      $verbarHtml = '<div style="margin:10px 0 0;padding:10px 12px;border-radius:10px;background:#fff6e5;border:1px solid #f0dcb0;color:#7a4d00;font-size:13.5px;">⚠️ ' + $safe + '</div>'
+    }
+  }
+} catch { }
+$outHtml = $tpl.Replace('__DATA__', $b64).Replace('__VERBAR__', $verbarHtml)
   # 校验：解析得动、且占位符真的被换掉了
   try { $null = $payloadJson | ConvertFrom-Json } catch { Write-Host ("❌ 生成的看板数据不是合法 JSON：" + $_.Exception.Message) -ForegroundColor Red; exit 1 }
   if ($outHtml.Contains('__DATA__')) { Write-Host '❌ 模板里的 __DATA__ 没被替换掉' -ForegroundColor Red; exit 1 }

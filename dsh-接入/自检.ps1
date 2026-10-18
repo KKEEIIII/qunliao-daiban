@@ -60,6 +60,58 @@ function Add-Check([string]$name, [string]$level, [string]$detail) {
   $checks.Add([pscustomobject]@{ name = $name; level = $level; detail = $detail })
 }
 
+# ---------- 0c. 版本：是不是最新版（2026-10-18 加） ----------
+# 目的：让"装了旧版的人"自己看到「请安装最新版本」，不依赖他记得看文档。
+# 做法：本机版本（版本.txt）vs GitHub 最新 Release 的 tag。
+#   · 查不到（离线/网络受限）→ 不报错，只写"未能检查更新"（离线用户不该被吓）
+#   · 结果写进 群聊待办\最新版本提示.txt → 看板页/控制台页会读它并显示横幅
+$instVer = ''
+$verTxtPath = Join-Path $ws '版本.txt'
+if (-not (Test-Path -LiteralPath $verTxtPath)) {
+  # 开发工作区里没有根目录 版本.txt（它只打进包里）→ 回退找 发布\ 下的
+  $altVer = Join-Path $ws '发布\版本.txt'
+  if (Test-Path -LiteralPath $altVer) { $verTxtPath = $altVer }
+}
+if (Test-Path -LiteralPath $verTxtPath) {
+  $mv = [regex]::Match([System.IO.File]::ReadAllText($verTxtPath, [System.Text.Encoding]::UTF8), '(?m)^版本\s*:\s*(\S+)')
+  if ($mv.Success) { $instVer = $mv.Groups[1].Value.Trim() }
+}
+function Convert-VerKey([string]$v) {
+  $m = [regex]::Match($v, 'v?(\d{8})-(\d{4})')
+  if ($m.Success) { return [long]($m.Groups[1].Value + $m.Groups[2].Value) }
+  return [long]0
+}
+$latestVer = ''
+try {
+  # ⚠️ PS 5.1 默认可能还是 TLS1.0/1.1，GitHub 只收 TLS1.2 → 不设这行会一直"离线"
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+  $savedProxyC = [System.Net.WebRequest]::DefaultWebProxy
+  [System.Net.WebRequest]::DefaultWebProxy = $null
+  try {
+    $relResp = Invoke-RestMethod -Uri 'https://api.github.com/repos/KKEEIIII/qunliao-daiban/releases/latest' -Headers @{ 'User-Agent' = 'dsh-todo-selfcheck'; 'Accept' = 'application/vnd.github+json' } -TimeoutSec 6
+    $latestVer = [string]$relResp.tag_name
+  } finally { [System.Net.WebRequest]::DefaultWebProxy = $savedProxyC }
+} catch { }
+$hintFile = Join-Path $ws '群聊待办\最新版本提示.txt'
+$hintLine = ''
+$dlUrl = 'https://github.com/KKEEIIII/qunliao-daiban/releases/latest'
+if ($latestVer -ne '' -and $instVer -ne '') {
+  if ((Convert-VerKey $latestVer) -gt (Convert-VerKey $instVer)) {
+    $hintLine = 'OUTDATED|' + $latestVer + '|' + $instVer + '|请安装最新版本：' + $latestVer + '（本机 ' + $instVer + '）｜下载：' + $dlUrl
+    Add-Check '版本' 'yellow' ('本机 ' + $instVer + '，最新 ' + $latestVer + ' → 请安装最新版本（' + $dlUrl + '）')
+  } else {
+    $hintLine = 'LATEST|' + $latestVer + '|' + $instVer + '|已是最新版（' + $instVer + '）'
+    Add-Check '版本' 'green' ('已是最新版（' + $instVer + '）')
+  }
+} else {
+  $hintLine = 'UNKNOWN||' + $instVer + '|未能检查更新（离线或网络受限）；本机 ' + $instVer
+  Add-Check '版本' 'green' ('本机 ' + $instVer + '（未能检查更新：离线或网络受限）')
+}
+try {
+  $hintDir = Split-Path -Parent $hintFile
+  if (Test-Path -LiteralPath $hintDir) { [System.IO.File]::WriteAllText($hintFile, $hintLine, (New-Object System.Text.UTF8Encoding($false))) }
+} catch { }
+
 # ---------- 1. DSH 进程与端口 ----------
 $dsh = @()   # DSH 各版本进程名不同（2.x 是 DSH Desktop）→ 三个都查，别再写死一个
 foreach ($pn in @('DeepSeek Harness', 'DSH Desktop', 'dsh')) { $dsh += @(Get-Process -Name $pn -ErrorAction SilentlyContinue) }

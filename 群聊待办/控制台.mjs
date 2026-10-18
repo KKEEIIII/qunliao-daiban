@@ -19,7 +19,7 @@
 //
 // 用法（一般不用直接跑，由 控制台.ps1 调用）：
 //   node 控制台.mjs <状态JSON路径>
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -113,6 +113,7 @@ const html = `<!DOCTYPE html>
 <div class="wrap">
   <div id="banner" class="warnbox off"></div>
   <h1>群聊待办 · 控制台</h1>
+__VERBAR__
   <div class="sub">生成于 <span id="gen">-</span> ·
     <span id="subServer">改完点右下角「<b>确定</b>」→ <b>立刻应用</b>到本机（本页由本地控制台服务提供，仅监听 127.0.0.1；用完自动关页 + 自动停服务）</span>
   </div>
@@ -438,5 +439,18 @@ const payload = {
   autostart: { enabled: !!(S.autostart && S.autostart.enabled) }
 }
 const b64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
-writeFileSync(out, html.replace('__DATA__', b64), 'utf8')
+// 2026-10-18：版本横幅（读自检写的 群聊待办/最新版本提示.txt；已最新/离线 → 空）
+function versionBarHtml() {
+  try {
+    const p = join(here, '最新版本提示.txt')
+    if (!existsSync(p)) return ''
+    const fs = readFileSync(p, 'utf8').trim().split('|')
+    if (fs.length >= 4 && fs[0] === 'OUTDATED') {
+      const safe = fs[3].replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      return '<div style="margin:10px 0 0;padding:10px 12px;border-radius:10px;background:#fff6e5;border:1px solid #f0dcb0;color:#7a4d00;font-size:13.5px;">⚠️ ' + safe + '</div>'
+    }
+  } catch { }
+  return ''
+}
+writeFileSync(out, html.replace('__DATA__', b64).replace('__VERBAR__', versionBarHtml()), 'utf8')
 console.log('控制台.html 已生成：' + out)

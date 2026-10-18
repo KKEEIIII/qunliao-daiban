@@ -164,6 +164,7 @@ const html = `<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>群聊待办看板</h1>
+__VERBAR__
   <div class="sub">
     数据来自 <code>群聊待办/todos.json</code>（生成于 <span id="gen">-</span>）·
     勾选后点右下角「导出改动」，再执行
@@ -347,7 +348,20 @@ const html = `<!DOCTYPE html>
 // 数据以 base64(UTF-8) 内嵌：避免中文在 file:// + 各种默认编码下变乱码
 const payload = { generatedAt: nowIso(), items }
 const b64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
-writeFileSync(boardPath, html.replace('__DATA__', b64), 'utf8')
+// 2026-10-18：版本横幅（读自检写的 群聊待办/最新版本提示.txt；已最新/离线 → 空）
+function versionBarHtml() {
+  try {
+    const p = join(todoDir, '最新版本提示.txt')
+    if (!existsSync(p)) return ''
+    const fs = readFileSync(p, 'utf8').trim().split('|')
+    if (fs.length >= 4 && fs[0] === 'OUTDATED') {
+      const safe = fs[3].replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      return '<div style="margin:10px 0 0;padding:10px 12px;border-radius:10px;background:#fff6e5;border:1px solid #f0dcb0;color:#7a4d00;font-size:13.5px;">⚠️ ' + safe + '</div>'
+    }
+  } catch { }
+  return ''
+}
+writeFileSync(boardPath, html.replace('__DATA__', b64).replace('__VERBAR__', versionBarHtml()), 'utf8')
 
 let memoNote = '（--noMemo：没动 MEMO.md）'
 if (!NO_MEMO) {
