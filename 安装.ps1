@@ -165,6 +165,21 @@ if (-not $DryRun) {
   }
   if ($kept -gt 0) { Ok ('检测到已有 ' + $kept + ' 个配置文件 → 重装会保留你的设置') }
 }
+# 存量检测（2026-10-18，外部复测 P1-1）：
+#   已经装了旧版的机器上，dsh-msg-memo 的清单可能带 BOM → 下次重启 DSH 会**静默跳过整个插件**。
+if (Test-Path -LiteralPath $InstallDir) {
+  $staleBom = @()
+  foreach ($n in @('dsh-msg-memo\package.json', 'dsh-msg-memo\cordis.patch.yml', 'dsh-msg-memo\config.json')) {
+    $p0 = Join-Path $InstallDir $n
+    if (-not (Test-Path -LiteralPath $p0)) { continue }
+    $b0 = [System.IO.File]::ReadAllBytes($p0)
+    if ($b0.Length -ge 3 -and $b0[0] -eq 0xEF -and $b0[1] -eq 0xBB -and $b0[2] -eq 0xBF) { $staleBom += $n }
+  }
+  if ($staleBom.Count -gt 0) {
+    Warn ('检测到旧安装的插件清单带 BOM（DSH 会静默跳过整个插件）：' + ($staleBom -join '、'))
+    Say '  → 本次安装会覆盖/修复成无 BOM 版本；装完请**重启 DSH 一次**，插件才会真正装载'
+  }
+}
 $subs = @('dsh-接入', 'wx-采集器', 'maafw-probe', 'dsh-msg-memo', '群聊待办')
 foreach ($d in $subs) {
   $from = Join-Path $src $d
@@ -173,6 +188,28 @@ foreach ($d in $subs) {
   Copy-Item -LiteralPath $from -Destination $InstallDir -Recurse -Force
   Ok ("{0} → {1}" -f $d, $InstallDir)
 }
+# 装完立刻在**文件层面**修一次清单 BOM（2026-10-18，外部复测 P1-1）
+# 第⑥步在 -SkipProfile 时被跳过，但"清单带 BOM"必须在这里治掉。
+if (-not $DryRun) {
+  $fixedBom = 0
+  foreach ($n in @('dsh-msg-memo\package.json', 'dsh-msg-memo\cordis.patch.yml', 'dsh-msg-memo\config.json')) {
+    $p1 = Join-Path $InstallDir $n
+    if (-not (Test-Path -LiteralPath $p1)) { continue }
+    $b1 = [System.IO.File]::ReadAllBytes($p1)
+    if ($b1.Length -ge 3 -and $b1[0] -eq 0xEF -and $b1[1] -eq 0xBB -and $b1[2] -eq 0xBF) {
+      if ($b1.Length -gt 3) { [System.IO.File]::WriteAllBytes($p1, $b1[3..($b1.Length - 1)]) }
+      else { [System.IO.File]::WriteAllBytes($p1, (New-Object byte[] 0)) }
+      $fixedBom++
+    }
+  }
+  if ($fixedBom -gt 0) { Ok ('已修复旧清单 BOM：' + $fixedBom + ' 个（重启 DSH 后插件才会真正装载）') }
+  else { Ok '插件清单无 BOM（不会被 DSH 静默跳过）' }
+  try {
+    $null = [System.IO.File]::ReadAllText((Join-Path $InstallDir 'dsh-msg-memo\package.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    Ok '插件清单可解析（裸 JSON.parse 不会报错）'
+  } catch { Warn ('插件清单解析失败：' + $_.Exception.Message) }
+}
+
 # ⚠️ 2026-10-15 修：`群聊待办\`（看板三个文件）原来不在 $subs 里 → 装完是个空目录、看板功能不存在，
 #    而 版本.txt 还把"新增 HTML 看板"列为这一版重点。
 # 另外：根目录下的零散文件（install/uninstall、几个说明文档、版本.txt）也要拷，

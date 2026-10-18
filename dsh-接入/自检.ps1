@@ -85,7 +85,21 @@ try { $c = New-Object System.Net.Sockets.TcpClient; $c.Connect('127.0.0.1', $Web
 # ---------- 2. 待办插件是否在跑 ----------
 $pluginLog = if ($PluginLogPath) { $PluginLogPath } else { Join-Path $ws '群聊待办\插件日志.txt' }
 if (-not (Test-Path -LiteralPath $pluginLog)) {
-  Add-Check '待办插件' 'red' '插件日志不存在（插件没装载或没跑过）'
+  # 2026-10-18：刚装完/还没重启 DSH 时日志本来就不存在 —— 别直接判红（见 6.6b 同样处理）。
+  $pmForLog = Join-Path $ws 'dsh-msg-memo\package.json'
+  $restartedForLog = $false
+  try {
+    $dshP = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'DSH|DeepSeek' })
+    if ($dshP.Count -gt 0 -and (Test-Path -LiteralPath $pmForLog)) {
+      $earliestForLog = ($dshP | Sort-Object StartTime | Select-Object -First 1).StartTime
+      $restartedForLog = ($earliestForLog -gt (Get-Item -LiteralPath $pmForLog).LastWriteTime)
+    }
+  } catch { }
+  if (-not $restartedForLog) {
+    Add-Check '待办插件' 'yellow' '插件日志还不存在（DSH 还没重启过）→ 重启 DSH 后插件才会装载并写日志；装载后本项转绿'
+  } else {
+    Add-Check '待办插件' 'red' '插件日志不存在（插件没装载或没跑过）'
+  }
 } else {
   $lines = @(Get-Content -LiteralPath $pluginLog -Encoding UTF8)
   $last = $lines[-1]
@@ -594,7 +608,26 @@ if ($badManifest.Count -gt 0) {
     }
   }
   if ($bundled -and -not (Test-Path -LiteralPath $plugLog)) {
-    Add-Check '插件清单' 'red' '插件已写进 DSH 的 bundles，但从来没有 群聊待办\插件日志.txt → bundle 很可能被 DSH 跳过了（清单 BOM / 解析失败）｜修：去掉 dsh-msg-memo 清单的 BOM，重启 DSH 后看日志是否出现'
+    # 2026-10-18（外部复测 P2-2）：全新安装后**必然**是"bundles 里有它、还没有插件日志"——
+    #   日志要等 DSH 重启后才写。原来一律判红，把用户往"又踩 BOM 坑"上带。
+    #   现在先看 DSH 有没有在安装（= package.json 的 mtime）之后重启过：
+    #     没重启（或 DSH 没在跑）→ 黄灯，说清"重启后才会装载"；重启过仍无日志 → 才是红灯。
+    $instMtime = $null
+    $pmPath = Join-Path $plugDir 'package.json'
+    if (Test-Path -LiteralPath $pmPath) { $instMtime = (Get-Item -LiteralPath $pmPath).LastWriteTime }
+    $restarted = $false
+    try {
+      $dshProcs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'DSH|DeepSeek' })
+      if ($dshProcs.Count -gt 0 -and $instMtime) {
+        $earliest = ($dshProcs | Sort-Object StartTime | Select-Object -First 1).StartTime
+        $restarted = ($earliest -gt $instMtime)
+      }
+    } catch { }
+    if (-not $restarted) {
+      Add-Check '插件清单' 'yellow' '插件已挂进 DSH 的 bundles，但 DSH 还没重启（重启后才会装载）→ 重启 DSH 一次，装载成功后本项自动转绿'
+    } else {
+      Add-Check '插件清单' 'red' '插件已写进 bundles、DSH 也重启过了，却从来没有 群聊待办\插件日志.txt → bundle 很可能被静默跳过（清单 BOM / 解析失败）｜修：检查 dsh-msg-memo 清单 BOM 后重启 DSH'
+    }
   } elseif ($bundled) {
     Add-Check '插件清单' 'green' ('清单无 BOM；插件已装载过（插件日志最后写入 ' + (Get-Item -LiteralPath $plugLog).LastWriteTime + '）')
   } else {
