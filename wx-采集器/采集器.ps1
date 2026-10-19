@@ -490,7 +490,7 @@ function Invoke-Pass([int]$index) {
 
       # ---------- 误入"非聊天界面"（群助手/服务通知…）→ 退回到会话列表再继续 ----------
       # 为什么需要：点进这类列表型界面后，**后面所有行的坐标都会错位、整轮白跑**。
-      # ignoreChats 能在列表层挡住一部分，但 OCR 把名字读错字就挡不住（实测「班级群」→「班纟及群」）。
+      # ignoreChats 能在列表层挡住一部分，但 OCR 把名字读错字就挡不住（实测「班级群」→「<OCR 错字示例>」）。
       # ⚠️ 检测**只用名字白名单**，不用"尾部带 (数字)"的形态启发式：
       #    实测「理综6班-勇往直前（25）」是**正常群名**（括号里是群人数），形态判断会误踢正常群。
       # ⚠️ 返回动作默认**关闭**（config.json 的 returnToMain.enabled = true 才生效）——
@@ -505,8 +505,103 @@ function Invoke-Pass([int]$index) {
         continue
       }
 
-      $cleanLines = @($parsed2.chatLines | Sort-Object y | ForEach-Object {
-          [pscustomobject]@{ x = $_.x; y = $_.y; t = (Format-OcrText $_.text) }
+      # ---------- 往期记录：滚轮向上翻几屏（2026-10-18 加） ----------
+      # 为什么加：只读"当前可见屏" = 只采到最后几条；几小时前发的通知永远采不到，
+      #   而群里真正要紧的（报名截止/会议改时间）恰恰经常在更早的位置。
+      # 做法：光标移到聊天区 → 滚轮向上 N 次 → 等渲染 → 截图 OCR → 重复（默认 2 屏）→
+      #   把每屏的非重叠部分拼到前面 → 最后滚回底部（还原用户视图）。
+      # 代价：每屏多一次截图 + OCR（约 0.6~1 秒）；只对**点开的会话**做，且可配置关闭。
+      $histScreens = if ($cfg.PSObject.Properties['historyScreens']) { [int]$cfg.historyScreens } else { 2 }
+      $histNotches = if ($cfg.PSObject.Properties['historyWheelNotches']) { [int]$cfg.historyWheelNotches } else { 3 }
+      $histSettle = if ($cfg.PSObject.Properties['historySettleMs']) { [int]$cfg.historySettleMs } else { 350 }
+      $histMaxLines = if ($cfg.PSObject.Properties['historyMaxLines']) { [int]$cfg.historyMaxLines } else { 150 }
+      $newestTexts = @($parsed2.chatLines | Sort-Object y | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+      # 锚点（2026-10-19）：上一轮记录过的"最旧 3 行"。翻页读到它就停 —— 再往上都是记过的内容，
+      # 继续翻只会把同一批历史重新 OCR（费时费 token，还可能让模型重复抽同一条待办）。
+      $anchorFile = Join-Path $stateDir 'seen-anchors.txt'
+      $anchorKey = 'wx|' + $header
+      $anchors = @(Get-ChatAnchorLines -AnchorFile $anchorFile -Key $anchorKey)
+      $anchorHitFirst = Test-ChatAnchorHit -Lines $newestTexts -Anchors $anchors
+      if ($anchorHitFirst -and $anchors.Count -gt 0) { Log '  往期滚动：当前屏全是上一轮记录过的内容 → 不往前翻（省时省 token）' }
+      $screens = @(, $newestTexts)
+      if ($histScreens -gt 0 -and $histNotches -gt 0 -and -not $anchorHitFirst) {
+        $moved = Move-WxCursorToChatArea -Hwnd $info.hwnd
+        if (-not $moved) { Log '  往期滚动：光标没能移到聊天区（窗口矩形取不到）→ 跳过' }
+        else {
+          $scrolled = 0
+          for ($hi = 1; $hi -le $histScreens; $hi++) {
+            Invoke-WxWheel -Notches $histNotches
+            Start-Sleep -Milliseconds $histSettle
+            $shotH = Join-Path $shotDir ('hist-{0}-{1}.png' -f ([DateTime]::Now.ToString('HHmmss')), $hi)
+            try {
+              $null = Save-WxWindowShot -Hwnd $info.hwnd -Path $shotH -Scale $ocrScale
+              $rowsH = Invoke-WxOcr -Path $shotH -Scale $ocrScale
+              $parsedH = Get-ChatsFromRows $rowsH
+              $textsH = @($parsedH.chatLines | Sort-Object y | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            } catch {
+              Log ('  往期滚动第 {0} 屏失败：{1}' -f $hi, $_.Exception.Message)
+              $textsH = @()
+            }
+            $scrolled++
+            if ($textsH.Count -eq 0) { Log ('  往期滚动：第 {0} 屏没读到内容（可能到顶了）→ 停止' -f $hi); break }
+            $anchorHit = Test-ChatAnchorHit -Lines $textsH -Anchors $anchors
+            $same = (($textsH -join "`n") -eq ($screens[0] -join "`n"))
+            if ($same) { Log ('  往期滚动：第 {0} 屏和上一屏一样（到顶/没滚动）→ 停止' -f $hi); break }
+            $screens += , $textsH
+            if ($anchorHit) {
+              Log ('  往期滚动：第 {0} 屏读到上一轮记录过的内容 → 停止翻页（再往上是已记过的）' -f $hi)
+              break
+            }
+          }
+          if ($scrolled -gt 0) {
+            # 滚回底部（多滚 2 格贴底），还原用户视图
+            Invoke-WxWheel -Notches (-($histNotches * $scrolled) - 2) -StepDelayMs 40
+            Start-Sleep -Milliseconds 200
+            Log ('  往期滚动：翻了 {0} 屏（画面已滚回底部）' -f ($screens.Count - 1))
+          }
+        }
+      }
+      # 合并（从最新一屏往前拼）。两层去重缺一不可：
+      #   ① 精确的重叠检测（older 尾部 == newer 头部，连续 k 行）—— 滚动正好错开半屏时最准；
+      #   ② **内容去重**（同一行文本已在合并结果里出现过就丢弃）—— OCR 对同一行偶尔会有细微差异，
+      #      精确比对抓不到，光靠 ① 会把同一批消息重复送进模型（白花钱，还可能让模型把同一条待办抽两次）。
+      #   ② 只跨屏去重；同一屏内的重复（"收到"连发）保留，因为那是真实内容。
+      $merged = @($screens[0])
+      $seen = @{}
+      foreach ($l in $merged) { $n0 = Norm $l; if ($n0) { $seen[$n0] = 1 } }
+      for ($si = 1; $si -lt $screens.Count; $si++) {
+        $older = @($screens[$si])
+        $newer = @($merged)
+        $k = 0
+        $maxK = [Math]::Min($older.Count, $newer.Count)
+        for ($kk = $maxK; $kk -ge 1; $kk--) {
+          $tail = ($older[($older.Count - $kk)..($older.Count - 1)]) -join "`n"
+          $head = ($newer[0..($kk - 1)]) -join "`n"
+          if ($tail -eq $head) { $k = $kk; break }
+        }
+        $rest = if ($k -ge $older.Count) { @() }
+                elseif ($k -gt 0) { if ($older.Count - $k - 1 -ge 0) { @($older[0..($older.Count - $k - 1)]) } else { @() } }
+                else { $older }
+        # ② 内容去重（跨屏）
+        $keep = @()
+        foreach ($l in $rest) {
+          $n = Norm $l
+          if ($n -and $seen.ContainsKey($n)) { continue }
+          $keep += $l
+        }
+        foreach ($l in $rest) { $n = Norm $l; if ($n) { $seen[$n] = 1 } }
+        $merged = @($keep) + $merged
+        Log ('  往期合并：第 {0} 屏命中重叠 {1} 行，跨屏重复丢弃 {2} 行，净新增 {3} 行' -f $si, $k, ($rest.Count - $keep.Count), $keep.Count)
+      }
+      # 去掉重复出现的聊天标题行（每屏顶部都有它），并限总行数（保护 token 用量）
+      if (-not [string]::IsNullOrWhiteSpace($header)) {
+        $merged = @($merged | Where-Object { (Norm $_) -ne (Norm $header) })
+      }
+      if ($histMaxLines -gt 0 -and $merged.Count -gt $histMaxLines) {
+        $merged = @($merged[($merged.Count - $histMaxLines)..($merged.Count - 1)])
+      }
+      $cleanLines = @($merged | ForEach-Object {
+          [pscustomobject]@{ x = 0; y = 0; t = $_ }
         } | Where-Object { -not [string]::IsNullOrWhiteSpace($_.t) })
 
       # 按该群的规则过滤：mention 规则只保留命中关键词的行（+上一行发言人）；all 规则保留全部
@@ -565,6 +660,8 @@ function Invoke-Pass([int]$index) {
           lines = @($cleanLines | ForEach-Object { [ordered]@{ x = $_.x; y = $_.y; t = $_.t } })
         }
         Append-Record $rec | Out-Null; $written++
+        # 记下"这一轮记到的最旧 3 行"：下一轮翻页读到它就停（2026-10-19）
+        if (-not $Peek) { Save-ChatAnchors -AnchorFile $anchorFile -Key $anchorKey -Lines $merged }
         Log ("  → 标题「{0}」 校验={1} 内容变化={2} 正文 {3} 字" -f $header, $verified, $isNew, $text.Length)
       }
       if (-not $SaveShots) { Remove-Item -LiteralPath $shot2 -Force -ErrorAction SilentlyContinue }

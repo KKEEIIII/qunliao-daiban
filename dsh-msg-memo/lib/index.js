@@ -297,7 +297,7 @@ function editDistance(a, b) {
   return prev[m]
 }
 
-// 同一个群的宽松判定：允许一个是另一个的前缀（OCR/不同来源会把群名截断，如 '示例部门' vs '示例群C'）
+// 同一个群的宽松判定：允许一个是另一个的前缀（OCR/不同来源会把群名截断，如 '示例部门' vs '示例部门示例群C'）
 function sameChatLoose(chatA, chatB) {
   const ca = normLoose(chatA)
   const cb = normLoose(chatB)
@@ -311,7 +311,7 @@ function sameDueExact(dueA, dueB) {
 // 只有"同一个群 + 标题几乎一样"才算重复（宁可留一条重复的，也不要把两件不同的事并掉）。
 // 标定记录（10 个用例 9 通过；唯一的漏判是"OCR 错字 + 模型改写"双重变形，属可接受）：
 //   ✅ 合并：'参加示例部门见面会及培训' vs '参加示例部门见面及培训'（差 1 字）
-//   ✅ 合并：'统宣生见面会' vs '示例部门见面会'（OCR 错 1 字）
+//   ✅ 合并：'示例部门生见面会' vs '示例部门见面会'（OCR 错 1 字）
 //   ✅ 合并：同群 + 截止时间完全相同 + 标题差 ≤3 字
 //   ✅ 不合并：同群但两件不同的事（'参加示例活动A' vs '…会议（新区232）'，即使 due 相同）
 function isNearDuplicate(titleA, chatA, dueA, titleB, chatB, dueB) {
@@ -327,7 +327,7 @@ function isNearDuplicate(titleA, chatA, dueA, titleB, chatB, dueB) {
 
 // "同一件事、但新说法更具体"：同群 + 截止时间相同 + 旧标题是新标题的子串（新标题多了时间/地点）。
 // 实测：模型会按提示词规则 5 把带新细节的同一条事再输出一次，标题从
-//   '参加统宣生见面会及第一次培训' → '参加统宣生见面会及第一次培训（普照楼231，10月19日16点）'
+//   '参加示例部门生见面会及第一次培训' → '参加示例部门生见面会及第一次培训（普照楼231，10月19日16点）'
 // 这种情况不该新增一条，而应**就地升级**旧条目（保留更具体的说法，详情不丢）。
 function findSupersetTarget(title, chat, due, items) {
   const na = normLoose(title)
@@ -596,7 +596,7 @@ function mergeTodos(existing, incoming, records, onSkip) {
       continue
     }
     // 模糊去重：同一个群里"同一件事"被 OCR/模型读成两种说法时，不要重复建待办
-    // （实测：一度出现 '参加示例部门见面会及培训' 与 '参加统宣生见面会及第一次培训' 两条）
+    // （实测：一度出现 '参加示例部门见面会及培训' 与 '参加示例部门生见面会及第一次培训' 两条）
     const nearDup = items.some(
       (it) =>
         !['done', 'ignored'].includes(String(it?.status)) &&

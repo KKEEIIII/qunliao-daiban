@@ -61,5 +61,10 @@
     "enabled": false
   },
   "_notes_qqOffscreen": "true = 每轮采集前把 QQ 挪到屏幕外（保持“显示”状态、不最小化），采完还原到原位置。为什么要这样做：Maa 用的是 Windows.Graphics.Capture，抓不到【最小化】的窗口（实测 CreateForCaptureItem failed ret=-2147024809、画面全黑）；但能抓【屏幕外】的窗口（2026-10-15 实测：挪到 x=2760 后 Maa 截图 1008x720、全黑 0%、内容正常）。三层还原保险：① 函数 finally ② -Once 的 exit 之前显式还原③ 启动时读 dsh-接入\\logs\\qq-窗口位置.json 自愈（即使上次被强杀也救得回来，已实测）。默认 false —— 它会移动你的窗口，属于“看着 QQ 消失”的魔法操作，想用再开。",
+  "qqHistoryScreens": 2,
+  "qqHistoryNotches": 3,
+  "qqHistorySettleMs": 600,
+  "qqHistoryMaxLines": 150,
+  "_notes_qqHistory": "往期记录（2026-10-19）：读到一个群后，把光标移到聊天区中心、滚轮向上翻 qqHistoryScreens 屏，每屏 Maa 截图 + OCR，用\"重叠 + 跨屏内容去重\"合并，翻完滚回底部。0 = 关闭。注意：滚动发生在**聊天区**（会临时移动光标，滚完还原）；如果 QQ 窗口被别的窗口遮住，Maa 后台截图仍然有效。",
   "_设置说明": "groupWhitelist：要盯的 QQ 群名（QQ 采集依赖 MaaFramework 后台截图，坐标可能需要在你自己机器上重新标定，见 快速开始.md）"
 }

@@ -137,7 +137,7 @@ if (-not $Yes -and -not $DryRun) {
   }
   if (-not $WxGroups) {
     Say '  要盯的微信群名（原样写，多个用逗号分隔；留空=所有会话都看）'
-    $WxGroups = Read-HostSafe '  例如: 26人工智能2班班级群'
+    $WxGroups = Read-HostSafe '  例如: 班级群A'
   }
   if (-not $QqGroups) {
     Say '  要盯的 QQ 群名（原样写，多个用逗号分隔；留空=不采 QQ）'

@@ -285,7 +285,7 @@ function Test-QqPrefixText {
     .SYNOPSIS  粗筛（只挑"值得点开看看"的行；真正的白名单判定一律用点开后的聊天头部）
     .DESCRIPTION
       列表里的群名会被截断、OCR 又会认错字，所以只比前 N 个字：
-        N=3 且允许差 1 个字（"示例学校新闻"→"仰慝新"、"示例群B"→"YTV有"）
+        N=3 且允许差 1 个字（"示例学校新闻"→"示例学校新闻新"、"示例群B"→"示例群B有"）
       不要用 n=4：'2026．10…' 和 '2026级…' 前 4 字只差 1，会把不相关的群当候选（实测踩过）。
   #>
   param([string]$Name, [string]$Pattern, [int]$PrefixLen = 3)
@@ -406,4 +406,46 @@ function Enable-QqFocus {
   [void][WxNative]::SetForegroundWindow($h)
   Start-Sleep -Milliseconds 500
   return ([WxNative]::GetForegroundWindow() -eq $h)
+}
+function Get-QqChatScreenPoint {
+  <#
+    .SYNOPSIS  聊天区中心对应的**屏幕坐标**（滚轮要真实光标位置）
+    .DESCRIPTION
+      为什么不能用列表那套坐标：会话列表在左（sessionXFrom~To），聊天正文在右（chatXFrom~chatXTo）。
+      滚轮作用于**光标下的窗口区域**，在列表上滚只会翻列表、不会翻聊天记录。
+      取 x = 聊天区中点、y = 抓图高度的 60%（在头部栏之下、正文之中）。
+  #>
+  param([Parameter(Mandatory = $true)]$Ctx)
+  $win = $Ctx.win
+  $cfg = $Ctx.cfg
+  $xFrom = if ($cfg.PSObject.Properties['chatXFrom']) { [double]$cfg.chatXFrom } else { 0.28 }
+  $xTo = if ($cfg.PSObject.Properties['chatXTo']) { [double]$cfg.chatXTo } else { 0.78 }
+  $yAt = if ($cfg.PSObject.Properties['chatYFrom']) { [double]$cfg.chatYFrom } else { 0.3 }
+  $sx = $win.w / [double]$Ctx.captureW
+  $sy = $win.h / [double]$Ctx.captureH
+  $px = [int]($win.x + ($Ctx.captureW * (($xFrom + $xTo) / 2.0)) * $sx)
+  $py = [int]($win.y + ($Ctx.captureH * ($yAt + (1.0 - $yAt) * 0.55)) * $sy)
+  return [pscustomobject]@{ x = $px; y = $py }
+}
+
+function Invoke-QqChatWheel {
+  <#
+    .SYNOPSIS  在**聊天区**滚动（真实滚轮；临时移光标，滚完还原）
+    .PARAMETER Notches  滚几格（一格=120）；**正数向下、负数向上**（与 Invoke-QqWheel 一致）
+  #>
+  param([Parameter(Mandatory = $true)]$Ctx, [int]$Notches = 2, [int]$SettleMs = 700)
+  if ($Notches -eq 0) { return 0 }
+  if (-not ('WxWheel' -as [type])) { throw 'WxWheel 类型没定义（maacap.ps1 要先点源）' }
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  $pt = Get-QqChatScreenPoint -Ctx $Ctx
+  $saved = $null
+  try { $saved = [System.Windows.Forms.Cursor]::Position } catch { $saved = $null }
+  [void][WxNative]::SetCursorPos($pt.x, $pt.y)
+  Start-Sleep -Milliseconds 250
+  $delta = if ($Notches -gt 0) { -120 } else { 120 }
+  $times = [Math]::Abs($Notches)
+  [WxWheel]::Turn($delta, $times)
+  Start-Sleep -Milliseconds $SettleMs
+  if ($saved) { [void][WxNative]::SetCursorPos($saved.X, $saved.Y) }
+  return $Notches
 }

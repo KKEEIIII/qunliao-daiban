@@ -195,6 +195,7 @@ function Invoke-WxOcr {
   $result = $netTask.Result
 
   $rows = @()
+  $div = if ($Scale -gt 1) { [double]$Scale } else { 1.0 }
   foreach ($line in $result.Lines) {
     $xs = @(); $ys = @(); $hs = @(); $ws = @()
     foreach ($word in $line.Words) {
@@ -203,11 +204,14 @@ function Invoke-WxOcr {
     }
     $rows += [pscustomobject]@{
       text = $line.Text
-      # 坐标空间约定：这是**放大后图像空间**的坐标（$script:win.width 即该图宽度），调用方按此比较。
-      x    = [int](($xs | Measure-Object -Minimum).Minimum)
-      y    = [int](($ys | Measure-Object -Minimum).Minimum)
-      h    = [int](($hs | Measure-Object -Maximum).Maximum)
-      w    = [int](($ws | Measure-Object -Maximum).Maximum)
+      # 坐标空间约定：OCR 跑在放大图上（×Scale），返回前**折算回窗口像素**，
+      # 调用方（Get-ChatsFromRows 的 0.10/0.42 列边界、rowGap=35、点击 nameY+24）全部按窗口像素标定。
+      # 2026-10-19 修：这里原来漏了折算 → 微信(scale=3) 所有会话名 x≈470 被列边界 [0.10W,0.42W] 拒掉，
+      # 只有角标 "14"(x=161) 幸存 → "识别到 1 个会话：14"。QQ(scale=1) 不受影响。
+      x    = [int]([Math]::Round((($xs | Measure-Object -Minimum).Minimum) / $div))
+      y    = [int]([Math]::Round((($ys | Measure-Object -Minimum).Minimum) / $div))
+      h    = [int]([Math]::Round((($hs | Measure-Object -Maximum).Maximum) / $div))
+      w    = [int]([Math]::Round((($ws | Measure-Object -Maximum).Maximum) / $div))
     }
   }
   return $rows
@@ -239,12 +243,44 @@ function Invoke-WxClickAt {
   [WxNative]::Click($X, $Y)
 }
 
+# ==================== 真实鼠标滚轮（2026-10-18：翻往期聊天记录用） ====================
+#
+# 微信聊天区只响应真实 WM_MOUSEWHEEL；qqread.ps1 那边验证过：Maa 的 PostScroll 对 QQ 全无效，
+# 只有 mouse_event WHEEL 有效。这里把它做成通用函数。
+# ⚠️ dwData 有符号：正 = 向上（看更早），负 = 向下。类的签名是 uint，所以负值 [uint32](-120 -band 0xFFFFFFFF)。
+function Invoke-WxWheel {
+  param(
+    [Parameter(Mandatory = $true)][int]$Notches,   # 正 = 向上滚（更早的消息），负 = 向下滚
+    [int]$StepDelayMs = 70
+  )
+  if ($Notches -eq 0) { return }
+  $sign = if ($Notches -gt 0) { 1 } else { -1 }
+  # ⚠️ 不要写 [uint32]((120*$sign) -band 0xFFFFFFFF)：PS 5.1 里负数的 -band 结果再转 uint32 会抛
+  #   "Cannot convert value -120 to type UInt32"。用 BitConverter 拿补码，任何值都稳。（2026-10-18 实测）
+  $delta = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int](120 * $sign)), 0)
+  $n = [Math]::Abs($Notches)
+  for ($i = 0; $i -lt $n; $i++) {
+    [WxNative]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)   # MOUSEEVENTF_WHEEL
+    if ($StepDelayMs -gt 0) { Start-Sleep -Milliseconds $StepDelayMs }
+  }
+}
+
+# 把光标移到"聊天区中心"（滚轮作用于光标下的窗口；左侧 0~42% 是会话列表）
+function Move-WxCursorToChatArea {
+  param([Parameter(Mandatory = $true)][IntPtr]$Hwnd, [double]$XFactor = 0.72, [double]$YFactor = 0.55)
+  $r = New-Object WxNative+RECT
+  if (-not [WxNative]::GetWindowRect($Hwnd, [ref]$r)) { return $false }
+  $x = [int]($r.L + ($r.R - $r.L) * $XFactor)
+  $y = [int]($r.T + ($r.B - $r.T) * $YFactor)
+  return [WxNative]::SetCursorPos($x, $y)
+}
+
 # ==================== 误入非聊天界面的检测与返回 ====================
 #
 # 背景（为什么要这个）：会话列表里点某一行后，可能进的不是聊天，而是
 #   微信的「群助手 / 服务通知 / 订阅号消息」这类**列表型界面**（还有可能是独立的小窗口）。
 #   后果不是"少采一条"，而是**后面所有行坐标都错位、整轮白跑**。
-#   ignoreChats 能在列表层挡住一部分，但 OCR 会把名字读错字（实测「班级群」→「班纟及群」），
+#   ignoreChats 能在列表层挡住一部分，但 OCR 会把名字读错字（实测「班级群」→「<OCR 错字示例>」），
 #   一旦读错就挡不住，所以还需要"进去之后能退回来"。
 #
 # ⚠️ 实测结论（2026-10-15）：**ESC 不能当返回键** —— 对微信窗口发 ESC 会让它
@@ -511,13 +547,13 @@ function Test-ChatRuleMatch {
       OCR 会把群名读残，所以死写全名匹配不上，要容错。三路依次尝试：
         ① 归一化后直接包含
         ② 数字前缀：**规则里的数字串，以名字里的数字串开头**（OCR 把长数字读残）
-           例：规则 "26人工智能2班<示例群号>（官方）" ← 名字被读成 "26人工智能2班266"（<示例群号> → 266）
+           例：规则 "示例群A<示例群号>（官方）" ← 名字被读成 "示例群A266"（<示例群号> → 266）
            实测命中 ✅
         ③ 滑窗编辑距离 ≤1：在名字里滑动长度为 |规则| 的窗口找最像的一段
            注意：**这一路要求"名字 ≥ 规则"长度**，名字更短时进不来。
 
     ⚠️ 2026-10-15 更正注释（原注释举的第二个例子是错的，实测不成立）：
-      原注释写 "26人工智能2班班级群" 被读成 "26人工2册开纟及群" 也能靠 ③ 救回来 ——
+      原注释写 "示例群A班级群" 被读成 "<OCR 错字示例>" 也能靠 ③ 救回来 ——
       实测**匹配不上**：该残名比规则**短 1 个字符**（10 vs 11），③ 的长度门槛先挡住了；
       而且它与规则的编辑距离是 3（超出 ≤1 的容差）。这是**已知限制**，不是回归：
       旧版（1402~1620）同样匹配不上。真正需要覆盖这类残名时，应把「白名单写短一点」
@@ -534,7 +570,7 @@ function Test-ChatRuleMatch {
   #   · 另一个 AI 从 1402 版起就报"这一行方向反了"，我前几次判断"现状更宽松、先不动"；
   #   · 后来我**自己手写了一遍判定**做对照实验，得出"该救的是名字数字更长的情形"→ 改成
   #     `$m.Value.StartsWith($pd)`（名字数字以规则数字开头）；
-  #   · 那是**回归**：注释里的真实 OCR 残名 `26人工智能2班266`（规则 `…<示例群号>（官方）`）
+  #   · 那是**回归**：注释里的真实 OCR 残名 `示例群A266`（规则 `…<示例群号>（官方）`）
   #     反而匹配不上了，而第 ③ 步的滑窗编辑距离要求"名字比规则长"，救不回来。
   #   · 那个对照实验错在**把我自己的错误假设编码进了实验**（我假设该救的是"名字更长"）。
   #     对方跑的是**真实的 Test-ChatRuleMatch**，所以结论以它为准。
@@ -632,3 +668,103 @@ function Select-KeywordLines {
 
 
 
+
+
+# ==================== 多屏合并（微信 / QQ 共用，2026-10-19） ====================
+# 输入：从**新到旧**排列的多屏文本行（每屏 string[]）；输出：从旧到新、去掉跨屏重复的一串行。
+# 两层去重：
+#   ① 精确重叠：older 的尾部 == newer 的头部（连续 k 行）—— 滚动错开半屏时最准；
+#   ② 跨屏内容去重：同一行文本已在合并结果里出现过就丢弃 —— OCR 对同一行偶有差异，只靠①会重复。
+# 同一屏内部的重复（"收到"连发）保留，因为那是真实内容。
+function Merge-ChatScreens {
+  param(
+    [Parameter(Mandatory = $true)][object[]]$Screens,
+    [string]$Header = '',
+    [int]$MaxLines = 150,
+    [scriptblock]$Log = $null
+  )
+  if ($null -eq $Screens -or $Screens.Count -eq 0) { return @() }
+  $NormLine = { param($s) if ($null -eq $s) { return '' } return ($s -replace '\s', '') }
+  $merged = @($Screens[0])
+  $seen = @{}
+  foreach ($l in $merged) { $n = (& $NormLine $l); if ($n) { $seen[$n] = 1 } }
+  for ($si = 1; $si -lt $Screens.Count; $si++) {
+    $older = @($Screens[$si]); $newer = @($merged); $k = 0
+    $maxK = [Math]::Min($older.Count, $newer.Count)
+    for ($kk = $maxK; $kk -ge 1; $kk--) {
+      $tail = ($older[($older.Count - $kk)..($older.Count - 1)]) -join "`n"
+      $head = ($newer[0..($kk - 1)]) -join "`n"
+      if ($tail -eq $head) { $k = $kk; break }
+    }
+    $rest = if ($k -ge $older.Count) { @() }
+            elseif ($k -gt 0) { if ($older.Count - $k - 1 -ge 0) { @($older[0..($older.Count - $k - 1)]) } else { @() } }
+            else { $older }
+    $keep = @()
+    foreach ($l in $rest) { $n = (& $NormLine $l); if ($n -and $seen.ContainsKey($n)) { continue }; $keep += $l }
+    foreach ($l in $rest) { $n = (& $NormLine $l); if ($n) { $seen[$n] = 1 } }
+    $merged = @($keep) + $merged
+    if ($Log) { $dropCnt = [Math]::Max(0, (@($rest).Count - @($keep).Count)); & $Log ('  往期合并：第 {0} 屏 命中重叠 {1} 行、跨屏重复丢弃 {2} 行、净新增 {3} 行' -f $si, $k, $dropCnt, @($keep).Count) }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($Header)) {
+    $merged = @($merged | Where-Object { (& $NormLine $_) -ne (& $NormLine $Header) })
+  }
+  if ($MaxLines -gt 0 -and $merged.Count -gt $MaxLines) {
+    $merged = @($merged[($merged.Count - $MaxLines)..($merged.Count - 1)])
+  }
+  return $merged
+}
+
+# ==================== "已经记录过的内容"锚点（2026-10-19） ====================
+# 目的：翻往期时，一旦读到**上一轮已经记录过**的内容就停 —— 再往上都是记过的，
+#   继续翻只会把同一批历史重新 OCR（费时、费 token，还可能让模型重复抽同一条待办）。
+# 做法：记录落盘时把合并结果的"最旧 3 行"存成锚点（state\seen-anchors.txt，TSV：key<TAB>规范化行）；
+#   翻页时每读一屏就比对锚点，命中即停。
+function Get-ChatAnchorLines {
+  param([string]$AnchorFile, [string]$Key)
+  if ([string]::IsNullOrWhiteSpace($Key) -or -not (Test-Path -LiteralPath $AnchorFile)) { return @() }
+  $out = @()
+  foreach ($ln in [System.IO.File]::ReadAllLines($AnchorFile, [System.Text.Encoding]::UTF8)) {
+    $i = $ln.IndexOf([char]9)
+    if ($i -lt 0) { continue }
+    if ($ln.Substring(0, $i) -eq $Key) { $out += $ln.Substring($i + 1) }
+  }
+  return $out
+}
+
+function Test-ChatAnchorHit {
+  param([string[]]$Lines, [string[]]$Anchors)
+  if ($null -eq $Anchors -or $Anchors.Count -eq 0) { return $false }
+  if ($null -eq $Lines -or $Lines.Count -eq 0) { return $false }
+  foreach ($l in $Lines) {
+    $n = ($l -replace '\s', '')
+    if ([string]::IsNullOrWhiteSpace($n)) { continue }
+    foreach ($a in $Anchors) {
+      if ([string]::IsNullOrWhiteSpace($a)) { continue }
+      if ($n -eq $a) { return $true }
+      # OCR 对同一行偶有 1~2 字差异 → 长锚点再用"包含"兜一层（短锚点不用，避免误命中）
+      if ($a.Length -ge 8 -and ($n.Contains($a) -or $a.Contains($n))) { return $true }
+    }
+  }
+  return $false
+}
+
+function Save-ChatAnchors {
+  param([string]$AnchorFile, [string]$Key, [string[]]$Lines, [int]$Take = 3)
+  if ([string]::IsNullOrWhiteSpace($Key)) { return }
+  $norm = @($Lines | ForEach-Object { ($_ -replace '\s', '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($norm.Count -eq 0) { return }
+  $n = [Math]::Min($Take, $norm.Count)
+  $first = @($norm[0..($n - 1)])
+  $keep = @()
+  if (Test-Path -LiteralPath $AnchorFile) {
+    foreach ($ln in [System.IO.File]::ReadAllLines($AnchorFile, [System.Text.Encoding]::UTF8)) {
+      $i = $ln.IndexOf([char]9)
+      if ($i -lt 0) { continue }
+      if ($ln.Substring(0, $i) -ne $Key) { $keep += $ln }
+    }
+  }
+  foreach ($a in $first) { $keep += ($Key + [char]9 + $a) }
+  $dir = Split-Path -Parent $AnchorFile
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  [System.IO.File]::WriteAllLines($AnchorFile, $keep, (New-Object System.Text.UTF8Encoding($false)))
+}

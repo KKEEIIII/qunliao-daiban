@@ -51,5 +51,10 @@
     "微信团队"
   ],
   "_notes_returnToMain": "误入群助手/服务通知这类非聊天界面时怎么退回来。enabled=false 表示不自动返回（只记录并跳过该目标）。action: backspace(连按两次退格) / click(点 click.x,click.y 的窗口比例位置) / clickKey(先点再按 key)。**不要用 esc** —— 实测会让微信窗口隐藏、采集器彻底失明。",
+  "historyScreens": 2,
+  "historyWheelNotches": 3,
+  "historySettleMs": 350,
+  "historyMaxLines": 150,
+  "_notes_history": "往期记录（2026-10-18）：点开会话后，光标移到聊天区、滚轮向上翻 historyScreens 屏，每屏截图 OCR，用\"尾/头重叠\"去重后合并；翻完自动滚回底部还原视图。0 = 关闭（只读当前可见屏）。historyMaxLines = 合并后最多保留多少行（保护 token）。代价：每屏约 0.6~1 秒。",
   "_设置说明": "myAliases：填你自己的微信昵称（用来识别\"@我\"，可多个）。groupWhitelist：要盯的群名（留空=所有会话）。mentionOnly：true=只收提到我的消息。chatRules：按群定制规则，见 使用手册.md"
 }

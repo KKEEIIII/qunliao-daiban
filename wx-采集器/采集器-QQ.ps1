@@ -85,7 +85,7 @@ function Test-QqMatch([string]$name, [string]$pattern) {
   return $false
 }
 # 粗筛（只用来挑"值得点开看看"的行；真正的白名单判定一律用点开后的聊天头部）
-# 注意：门槛要严一点 —— "2026．10人工智能学院团课培训" 和 "示例群A" 前 4 字只差 1 个字，
+# 注意：门槛要严一点 —— "示例群F" 和 "示例群A" 前 4 字只差 1 个字，
 #       用 n=4/距离1 会把不相关的群也当候选（实测踩过）。
 function Test-QqPrefix([string]$name, [string]$pattern) {
   $a = Norm $name; $b = Norm $pattern
@@ -393,6 +393,45 @@ function Invoke-QqMaaPass {
           $s3 = Get-QqShot -Ctx $ctx -Path $p2
           $v3 = Get-QqChatView -Ctx $ctx -Rows $s3.rows
         }
+        # ---------- 往期记录（2026-10-19）：聊天区滚轮向上翻几屏 ----------
+        # 与微信侧同一套合并算法；注意滚轮必须作用在**聊天区**（Invoke-QqWheel 是列表用的，别混用）。
+        # 锚点（2026-10-19）：上一轮记录过的最旧 3 行，读到就停
+        $qqAnchorFile = Join-Path $stateDir 'seen-anchors.txt'
+        $qqAnchorKey = 'qq|' + $v3.header
+        $qqAnchors = @(Get-ChatAnchorLines -AnchorFile $qqAnchorFile -Key $qqAnchorKey)
+        $qqAnchorHitFirst = Test-ChatAnchorHit -Lines $v3.lines -Anchors $qqAnchors
+        if ($qqAnchorHitFirst -and $qqAnchors.Count -gt 0) { Log '  往期滚动：当前屏全是上一轮记录过的内容 → 不往前翻' }
+        $histN = if ($cfg.PSObject.Properties['qqHistoryScreens']) { [int]$cfg.qqHistoryScreens } else { 2 }
+        $histNotches = if ($cfg.PSObject.Properties['qqHistoryNotches']) { [int]$cfg.qqHistoryNotches } else { 3 }
+        $histSettle = if ($cfg.PSObject.Properties['qqHistorySettleMs']) { [int]$cfg.qqHistorySettleMs } else { 600 }
+        $histMax = if ($cfg.PSObject.Properties['qqHistoryMaxLines']) { [int]$cfg.qqHistoryMaxLines } else { 150 }
+        if ($histN -gt 0 -and $histNotches -gt 0 -and $v3.chars -ge 4 -and -not $qqAnchorHitFirst) {
+          $screens = @(, @($v3.lines))
+          $scrolled = 0
+          for ($hi = 1; $hi -le $histN; $hi++) {
+            try {
+              [void](Invoke-QqChatWheel -Ctx $ctx -Notches (-$histNotches) -SettleMs $histSettle)
+              $ph = Join-Path $shotDir ('qq-hist-{0}.png' -f $hi)
+              $sh = Get-QqShot -Ctx $ctx -Path $ph
+              $vh = Get-QqChatView -Ctx $ctx -Rows $sh.rows
+              $scrolled++
+              if ($vh.chars -lt 4) { Log ('  往期滚动：第 {0} 屏读不到内容（可能到顶）→ 停止' -f $hi); break }
+              if ((($vh.lines -join "`n")) -eq (($screens[0]) -join "`n")) { Log ('  往期滚动：第 {0} 屏与上一屏相同（没滚动/到顶）→ 停止' -f $hi); break }
+              if (Test-ChatAnchorHit -Lines $vh.lines -Anchors $qqAnchors) { $screens += , @($vh.lines); Log ('  往期滚动：第 {0} 屏读到上一轮记录过的内容 → 停止' -f $hi); break }
+              $screens += , @($vh.lines)
+            } catch {
+              Log ('  往期滚动第 {0} 屏失败：{1}' -f $hi, $_.Exception.Message)
+              break
+            }
+          }
+          if ($scrolled -gt 0) {
+            try { [void](Invoke-QqChatWheel -Ctx $ctx -Notches ($histNotches * $scrolled + 2) -SettleMs 400) } catch { }
+            $mergedLines = Merge-ChatScreens -Screens $screens -Header $v3.header -MaxLines $histMax -Log { param($m) Log $m }
+            $mergedText = ($mergedLines -join "`n")
+            $v3 = [pscustomobject]@{ text = $mergedText; header = $v3.header; chars = $mergedText.Length; lines = $mergedLines }
+            Log ('  往期滚动：翻了 {0} 屏 → 合并 {1} 行 / {2} 字（已滚回底部）' -f $scrolled, $mergedLines.Count, $v3.chars)
+          }
+        }
         $h3 = ''
         foreach ($g in $wl) { if (Test-QqMatch -name $v3.header -pattern $g) { $h3 = $g } }
         if (-not $h3) { Log ("  目标 y={0} → 头部'{1}' 不在白名单，跳过" -f $Target.y, $v3.header) }
@@ -425,6 +464,7 @@ function Invoke-QqMaaPass {
         }
         $newState[('maa|' + $Result.hit)] = $hh
         Log ("  {0} → 收下 {1} 字" -f $Result.hit, $Result.chars)
+        if (-not $Peek) { try { Save-ChatAnchors -AnchorFile (Join-Path $stateDir 'seen-anchors.txt') -Key ('qq|' + $Result.header) -Lines $Result.lines } catch { } }
         return [ordered]@{
           kind = 'chat'; ts = (Get-Date).ToString('o'); source = 'qq-maa'
           chat = $Result.header; expected = $Result.hit; verified = $true; changed = $true
