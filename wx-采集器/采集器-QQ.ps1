@@ -464,7 +464,7 @@ function Invoke-QqMaaPass {
         }
         $newState[('maa|' + $Result.hit)] = $hh
         Log ("  {0} → 收下 {1} 字" -f $Result.hit, $Result.chars)
-        if (-not $Peek) { try { Save-ChatAnchors -AnchorFile (Join-Path $stateDir 'seen-anchors.txt') -Key ('qq|' + $Result.header) -Lines $Result.lines } catch { } }
+        if (-not $Peek) { try { Save-ChatAnchors -AnchorFile (Join-Path $stateDir 'seen-anchors.txt') -Key ('qq|' + $Result.header) -Lines @($Result.lines | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.text } }) } catch { } }
         return [ordered]@{
           kind = 'chat'; ts = (Get-Date).ToString('o'); source = 'qq-maa'
           chat = $Result.header; expected = $Result.hit; verified = $true; changed = $true

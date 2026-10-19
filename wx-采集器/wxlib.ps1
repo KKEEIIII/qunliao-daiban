@@ -749,9 +749,20 @@ function Test-ChatAnchorHit {
 }
 
 function Save-ChatAnchors {
-  param([string]$AnchorFile, [string]$Key, [string[]]$Lines, [int]$Take = 3)
+  param([string]$AnchorFile, [string]$Key, [object[]]$Lines, [int]$Take = 3)   # ⚠️ 必须是 object[]：声明成 [string[]] 时 PowerShell 会在进函数前把 OCR 行对象转成字符串
   if ([string]::IsNullOrWhiteSpace($Key)) { return }
-  $norm = @($Lines | ForEach-Object { ($_ -replace '\s', '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  # 2026-10-19 修：QQ 的 .lines 是 OCR 行**对象**（@{text=…;x=…}），不是字符串 ——
+  #   上一版直接把对象塞进来，锚点存成了 "@{text=26新闻郄怙;x=452;…}"，永远匹配不上。
+  #   这里统一取 .text（字符串就直接用）。
+  $norm = @($Lines | ForEach-Object {
+      $v = $_
+      if ($null -ne $v -and $v -isnot [string]) {
+        if ($v.PSObject.Properties['text']) { $v = [string]$v.text } else { $v = [string]$v }
+      }
+      if ($null -eq $v) { return }
+      $t = ([string]$v) -replace '\s', ''
+      if (-not [string]::IsNullOrWhiteSpace($t)) { $t }
+    })
   if ($norm.Count -eq 0) { return }
   $n = [Math]::Min($Take, $norm.Count)
   $first = @($norm[0..($n - 1)])
