@@ -27,6 +27,9 @@ $ws = Split-Path -Parent $BaseDir
 $logDir = Join-Path $BaseDir 'logs'
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $logFile = Join-Path $logDir '自检.log'
+  # 2026-10-20：告警自测会反复调用本脚本（每次都写一行 ===== 自检：红灯 =====），
+  # 实测 81 条红灯里 78 条是演练 → 演练写入单独文件，正式日志只留真实结论。
+  if ($env:DSH_SELFTEST_RUNNING -eq '1') { $logFile = Join-Path $logDir '自检-演练.log' }
 $alertState = Join-Path $logDir '自检-已告警.json'
 
 # ---------- 周期配置（控制台页可改）：推导"陈旧"阈值 ----------
@@ -119,19 +122,54 @@ if ($dsh.Count -eq 0) {
   Add-Check 'DSH 进程' 'red' 'DSH 没在运行'
 } else {
   $portOk = $false
-  $WebPort = 0   # DSH 各版本端口不同（2.x 见过 43120）：优先用环境变量 DSH_WEB_URL，兜底 19387
-if ($env:DSH_WEB_URL -match ':(\d+)') { $WebPort = [int]$Matches[1] }
-# DSH_WEB_URL 是 DSH 在自己会话里导出的变量，**计划任务里继承不到** → 挨个试常见端口，都连不上就判黄灯（假红灯会推手机）
-if (-not $WebPort) {   # 解析不出来才扫（原来写成 -not http://127.0.0.1:19387：环境变量存在但解析失败时会跳过扫描）
-  $cand = @(19387, 43120, 43121)
   $WebPort = 0
-  foreach ($p in $cand) {
-    try { $t = New-Object System.Net.Sockets.TcpClient; $t.Connect('127.0.0.1', $p); if ($t.Connected) { $WebPort = $p; $t.Close(); break }; $t.Close() } catch { }
+  # (1) 环境变量优先（DSH 自己会话里有 DSH_WEB_URL，计划任务里拿不到）
+  if ($env:DSH_WEB_URL -match ':(\d+)') { $WebPort = [int]$Matches[1] }
+  # (2) 2026-10-20 加：从 DSH 进程实际监听的端口里找（权威来源）
+  #     为什么：DSH 重启后 Web 端口会变（实测 19387 -> 64483），写死候选会让计划任务里
+  #     永远报"进程在但 0 端口连不上"的红灯（那 3 条真实红灯就是这么来的）。
+  if (-not $WebPort) {
+    try {
+      $dshPids = @($dsh | ForEach-Object { $_.Id })
+      $listenPorts = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $dshPids -contains $_.OwningProcess } |
+        Select-Object -ExpandProperty LocalPort -Unique)
+      foreach ($lp in $listenPorts) {
+        try {
+          $t2 = New-Object System.Net.Sockets.TcpClient
+          $t2.Connect('127.0.0.1', [int]$lp)
+          if ($t2.Connected) { $WebPort = [int]$lp; $t2.Close(); break }
+          $t2.Close()
+        } catch { }
+      }
+    } catch { }
   }
-}
-try { $c = New-Object System.Net.Sockets.TcpClient; $c.Connect('127.0.0.1', $WebPort); $portOk = $c.Connected; $c.Close() } catch { $portOk = $false }
-  if ($portOk) { Add-Check 'DSH 进程' 'green' ("运行中（{0} 个进程，端口 {1} 可连）" -f $dsh.Count, $WebPort) }
-  else { Add-Check 'DSH 进程' 'red' ('进程在但 {0} 端口连不上' -f $WebPort) }
+  # (3) 兜底：常见端口
+  if (-not $WebPort) {
+    foreach ($p2 in @(19387, 43120, 43121, 64483)) {
+      try {
+        $t3 = New-Object System.Net.Sockets.TcpClient
+        $t3.Connect('127.0.0.1', $p2)
+        if ($t3.Connected) { $WebPort = $p2; $t3.Close(); break }
+        $t3.Close()
+      } catch { }
+    }
+  }
+  if ($WebPort -gt 0) {
+    try {
+      $c = New-Object System.Net.Sockets.TcpClient
+      $c.Connect('127.0.0.1', $WebPort)
+      $portOk = $c.Connected
+      $c.Close()
+    } catch { $portOk = $false }
+  }
+  if ($portOk) {
+    Add-Check 'DSH 进程' 'green' ('运行中（{0} 个进程，端口 {1} 可连）' -f $dsh.Count, $WebPort)
+  } elseif ($WebPort -gt 0) {
+    Add-Check 'DSH 进程' 'red' ('进程在但端口 {0} 连不上' -f $WebPort)
+  } else {
+    Add-Check 'DSH 进程' 'yellow' '进程在，但没发现可连的 Web 端口（可能正在启动/重启；若持续请检查 DSH 窗口）'
+  }
 }
 
 # ---------- 2. 待办插件是否在跑 ----------

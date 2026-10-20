@@ -456,8 +456,10 @@ function Invoke-Pass([int]$index) {
       $cx = [int]($info.left + $info.width * $cfg.clickX)
       # 点击 y 以"群名那一行"为基准（$target.nameY）；用 cluster 起点($target.y)会点串行 ——
       # 实测：本意点第 2 行的群，结果命中了第 3 行（cluster 起点比群名行更靠上/更靠下时都会偏）。
+      # 2026-10-19 修：原 +24 是"OCR 坐标放大 3 倍时代"标定的（=窗口像素 +8）。坐标折算修复后
+      # nameY 已是窗口像素，+24 会把点击推到下一行（实测连点连串行），改回 +8。
       $baseY = if ($target.PSObject.Properties['nameY'] -and $target.nameY -gt 0) { [int]$target.nameY } else { [int]$target.y }
-      $cy = [int]($info.top + $baseY + 24)
+      $cy = [int]($info.top + $baseY + 8)
       # 安全锁：点击坐标处最顶层的窗口必须是微信（否则会把点击送到别的程序上）
       $topAt = [WxNative]::TopAt($cx, $cy)
       if ($topAt -ne $info.hwnd) {
