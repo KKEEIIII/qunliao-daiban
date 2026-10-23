@@ -172,6 +172,40 @@ if ($dsh.Count -eq 0) {
   }
 }
 
+# ---------- 1b. DSH 版本：运行中的是不是磁盘上最新的一份（2026-10-23 加） ----------
+# 为什么：本机曾同时存在两份安装（0.2.0-rc.2 旧 / 0.2.1-rc.2 新），启动文件夹那个指向旧版的
+#   快捷方式开机先把旧版拉起来 → 用户感觉"开机自启永远是老版本"。这条直接把它报出来。
+try {
+  $dshProcs2 = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Where-Object { $_.Path })
+  if ($dshProcs2.Count -gt 0) {
+    $runPath2 = $dshProcs2[0].Path
+    $runVer2 = [string](Get-Item -LiteralPath $runPath2 -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+    $cands2 = New-Object System.Collections.Generic.List[string]
+    $cands2.Add($runPath2)
+    foreach ($root2 in @('D:\', 'E:\', 'C:\')) {
+      if (-not (Test-Path -LiteralPath $root2)) { continue }
+      foreach ($d2 in @(Get-ChildItem -LiteralPath $root2 -Directory -ErrorAction SilentlyContinue)) {
+        $cands2.Add((Join-Path $d2.FullName 'DeepSeek Harness.exe'))
+      }
+    }
+    $best2 = $null
+    foreach ($c2 in $cands2) {
+      if (-not (Test-Path -LiteralPath $c2 -PathType Leaf)) { continue }
+      $it2 = Get-Item -LiteralPath $c2 -ErrorAction SilentlyContinue
+      if (-not $it2) { continue }
+      $mm2 = [regex]::Match([string]$it2.VersionInfo.FileVersion, '\d+(\.\d+){1,3}')
+      $v2 = if ($mm2.Success) { [version]$mm2.Value } else { [version]'0.0.0' }
+      $kk2 = [pscustomobject]@{ path = $c2; ver = $v2; vt = [string]$it2.VersionInfo.FileVersion; time = $it2.LastWriteTime }
+      if ((-not $best2) -or ($kk2.ver -gt $best2.ver) -or (($kk2.ver -eq $best2.ver) -and ($kk2.time -gt $best2.time))) { $best2 = $kk2 }
+    }
+    if ($best2 -and ($best2.path -ne $runPath2)) {
+      Add-Check 'DSH 版本' 'yellow' ('正在运行 ' + $runVer2 + '（' + $runPath2 + '），磁盘最新 ' + $best2.vt + '（' + $best2.path + '）→ 开机可能拉起旧版｜修：在最新版目录里跑 dsh-接入\开机自启DSH.ps1 -Enable，并检查启动文件夹里的 DeepSeek Harness.lnk')
+    } else {
+      Add-Check 'DSH 版本' 'green' ('运行中 ' + $runVer2 + '，就是磁盘上最新的一份')
+    }
+  }
+} catch { }
+
 # ---------- 2. 待办插件是否在跑 ----------
 $pluginLog = if ($PluginLogPath) { $PluginLogPath } else { Join-Path $ws '群聊待办\插件日志.txt' }
 if (-not (Test-Path -LiteralPath $pluginLog)) {

@@ -40,24 +40,46 @@ function Log([string]$m) {
 }
 
 # 找 DSH 主程序：① 显式传入 ② 正在运行的进程路径（最可靠）③ 常见安装位置
+# 取一个 exe 的"版本键"：优先 FileVersion 的数字部分，否则按文件时间
+function Get-DshExeKey([string]$path) {
+  $i = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+  if (-not $i) { return $null }
+  $vt = [string]$i.VersionInfo.FileVersion
+  $m = [regex]::Match($vt, '\d+(\.\d+){1,3}')
+  $ver = if ($m.Success) { [version]$m.Value } else { [version]'0.0.0' }
+  return [pscustomobject]@{ path = $path; ver = $ver; verText = $vt; time = $i.LastWriteTime }
+}
+
+# 找 DSH 主程序。**返回版本最高的那个**（2026-10-23 改）
+# 为什么改：本机实测同时存在两份安装
+#   · <DSH安装目录>\DeepSeek Harness.exe        0.2.0-rc.2（9/29，旧）
+#   · E:\DEEPSSEEK HARDNESS\DeepSeek Harness.exe       0.2.1-rc.2（10/17，新）
+# 原来的实现"取第一个存在的"→ 常常选中旧版；而开机时启动文件夹里那个指向旧版的 .lnk
+# 会先把旧版拉起来，本脚本看到"进程同名已在运行"就不再启动 → 用户永远用老版本。
 function Find-DshExe {
   if ($ExePath -and (Test-Path -LiteralPath $ExePath)) { return $ExePath }
-  $p = Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path -notmatch 'app.asar' } | Select-Object -First 1
-  if ($p -and $p.Path) { return $p.Path }
-  $cands = @(
-    (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'),
-    (Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness\DeepSeek Harness.exe')
-  )
-  # 再扫一遍常见根目录（有人装在 D:\ / E:\ 自定义目录）
+  $cands = New-Object System.Collections.Generic.List[string]
+  foreach ($p in @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)) {
+    if ($p.Path -and ($p.Path -notmatch 'app.asar')) { $cands.Add($p.Path) }
+  }
+  $cands.Add((Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'))
+  $cands.Add((Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'))
+  if (${env:ProgramFiles(x86)}) { $cands.Add((Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness\DeepSeek Harness.exe')) }
   foreach ($root in @('D:\', 'E:\', 'C:\')) {
-    if (Test-Path -LiteralPath $root) {
-      $cands += @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Join-Path $_.FullName 'DeepSeek Harness.exe' })
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+      $cands.Add((Join-Path $d.FullName 'DeepSeek Harness.exe'))
     }
   }
-  foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return $c } }
+  $best = $null
+  foreach ($c in $cands) {
+    if (-not ($c -and (Test-Path -LiteralPath $c -PathType Leaf))) { continue }
+    $k = Get-DshExeKey $c
+    if (-not $k) { continue }
+    if (-not $best) { $best = $k; continue }
+    if (($k.ver -gt $best.ver) -or (($k.ver -eq $best.ver) -and ($k.time -gt $best.time))) { $best = $k }
+  }
+  if ($best) { return $best.path }
   return $null
 }
 
@@ -88,6 +110,23 @@ if ($StartMinimized) {
   } catch { Log ('[自启] 任务自愈失败：' + $_.Exception.Message) }
   $exe = Find-DshExe
   if (-not $exe) { Log '[自启] ❌ 找不到 DSH 主程序，放弃'; exit 1 }
+  # 2026-10-23 加：核对"正在运行的 DSH 是不是最新版"。
+  # 旧逻辑是"进程同名就算已就绪 → 不启动"：启动文件夹那个指向旧版的快捷方式先把 0.2.0 拉起来，
+  # 本脚本就永远不启动 0.2.1 → 用户感觉"开机自启永远是老版本"。
+  try {
+    $newestPath = Find-DshExe
+    $runProcs = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Where-Object { $_.Path })
+    if ($runProcs.Count -gt 0 -and $newestPath) {
+      $runPath = $runProcs[0].Path
+      $runVer = [string](Get-Item -LiteralPath $runPath -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+      $newVer = [string](Get-Item -LiteralPath $newestPath -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+      Log ('[自启] 正在运行：' + $runPath + '（' + $runVer + '）')
+      Log ('[自启] 磁盘最新：' + $newestPath + '（' + $newVer + '）')
+      if ($runPath -ne $newestPath) {
+        Log '[自启] ⚠️ 正在运行的不是最新版（旧版可能来自启动文件夹的快捷方式）→ 请修正该快捷方式，或在控制台关掉旧版自启'
+      }
+    }
+  } catch { }
   $running = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)
   if ($running.Count -gt 0) { Log ("[自启] DSH 已在运行（{0} 个进程），不重复启动" -f $running.Count); exit 0 }
   Log ("[自启] 启动：{0}" -f $exe)
@@ -186,6 +225,24 @@ if ($Enable) {
   }
   Log ("[自启] 已启用（{0}）：{1} → 登录后启动并最小化" -f $mech, $exe)
   Write-Host ("✅ 已开启（{0}）：下次登录 Windows 时，DSH 会自动在后台最小化启动" -f $mech)
+
+  # 2026-10-23 加：顺手把"启动文件夹里的 DSH 快捷方式"也指向最新版。
+  # 本机实测它就是"开机拉起旧版"的真正原因（两套入口并存时，快捷方式抢先启动旧版，
+  # 我们的任务随后看到进程同名就不再启动 → 新版永远起不来）。
+  try {
+    $lnkPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\DeepSeek Harness.lnk'
+    if (Test-Path -LiteralPath $lnkPath) {
+      $sh = New-Object -ComObject WScript.Shell
+      $sc = $sh.CreateShortcut($lnkPath)
+      if ($sc.TargetPath -and ($sc.TargetPath -ne $exe)) {
+        $oldT = $sc.TargetPath
+        $sc.TargetPath = $exe
+        $sc.WorkingDirectory = Split-Path -Parent $exe
+        $sc.Save()
+        Log ('[自启] 已把启动文件夹快捷方式改指向最新版：' + $oldT + ' → ' + $exe)
+      }
+    }
+  } catch { Log ('[自启] 修正启动快捷方式失败：' + $_.Exception.Message) }
   Write-Host ("   主程序：{0}" -f $exe)
   if ($StartNow) {
     Write-Host '   -StartNow：现在按同样方式启动一次（若 DSH 已在运行会跳过）……'
