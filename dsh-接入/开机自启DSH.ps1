@@ -21,6 +21,7 @@ param(
   [switch]$Status,
   [switch]$StartNow,
   [switch]$StartMinimized,   # 内部用：任务动作调这个分支
+  [switch]$Force,   # 允许从临时目录注册（默认拒绝，见 -Enable 里的护栏）
   [string]$ExePath = ''
 )
 
@@ -62,6 +63,29 @@ function Find-DshExe {
 
 # ---------- 内部：启动并最小化 ----------
 if ($StartMinimized) {
+  # 2026-10-23 加：自愈 —— 每次开机启动时核对"计划任务指向的脚本是不是当前这份"。
+  # 指向别处（临时目录/旧副本）或引用文件已不存在 → 立刻改回当前版本，避免开机一直拉老版本。
+  try {
+    $curTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($curTask) {
+      $arg = [string](($curTask.Actions | Select-Object -First 1).Arguments)
+      $pointsHere = $arg -and $arg.Contains($PSCommandPath)
+      $vbsOk = $true
+      $m = [regex]::Match($arg, '"([^"]+\.vbs)"')
+      if ($m.Success) { $vbsOk = Test-Path -LiteralPath $m.Groups[1].Value }
+      if ((-not $pointsHere) -or (-not $vbsOk)) {
+        Log ('[自启] 计划任务指向别处或已失效：' + $arg)
+        Log ('[自启] → 自动改回当前版本：' + $PSCommandPath)
+        $a2 = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('"{0}" "{1}" -StartMinimized' -f $vbs, $PSCommandPath)
+        $t2 = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $s2 = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+        Register-ScheduledTask -TaskName $taskName -Action $a2 -Trigger $t2 -Settings $s2 -Description '登录时自动启动 DSH 并最小化（由群聊待办控制台设置）' -Force -ErrorAction Stop | Out-Null
+        Log '[自启] 已修正'
+      } else {
+        Log ('[自启] 计划任务指向正确：' + $PSCommandPath)
+      }
+    }
+  } catch { Log ('[自启] 任务自愈失败：' + $_.Exception.Message) }
   $exe = Find-DshExe
   if (-not $exe) { Log '[自启] ❌ 找不到 DSH 主程序，放弃'; exit 1 }
   $running = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)
@@ -107,12 +131,31 @@ if ($Status -or ((-not $Enable) -and (-not $Disable))) {
   Write-Host ("  机制       : {0}" -f $st.mech)
   if ($st.run) { Write-Host ("  Run 项     : {0}" -f $st.run) }
   Write-Host ("  DSH 主程序 : {0}" -f $(if ($exe) { $exe } else { '未找到（装好后重试）' }))
+  # 2026-10-23 加：打印任务实际指向的脚本 —— "开机打开老版本"从这里看出来
+  $tt = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if ($tt) {
+    $targ = [string](($tt.Actions | Select-Object -First 1).Arguments)
+    $here = $targ.Contains($PSCommandPath)
+    $m2 = [regex]::Match($targ, '"([^"]+\.vbs)"')
+    $vOk = if ($m2.Success) { Test-Path -LiteralPath $m2.Groups[1].Value } else { $false }
+    Write-Host ('  任务指向   : {0}' -f $targ)
+    Write-Host ('  指向本机版 : {0}{1}' -f $(if ($here) { '是' } else { '否 —— 开机启动的会是别处的旧版本！跑一次 -Enable 修正' }), $(if ($vOk) { '' } else { '（且引用的 vbs 已不存在）' }))
+  }
   Write-Host '  无感程度   : 登录后后台最小化启动，不抢焦点不弹窗；任务栏会有一个 DSH 图标；采集/提醒照常跑'
   exit 0
 }
 
 # ---------- -Enable ----------
 if ($Enable) {
+  # 2026-10-23 加：不要从 %TEMP% 的临时解压副本里注册开机自启。
+  # 实测事故：在 %TEMP%\verify-out-1029-... 里跑过一次 -Enable，任务被写死到临时目录；
+  # 目录删掉后开机启动静默失败（任务结果=1），用户看到的却是"开机打开的还是老版本"。
+  if ($PSScriptRoot -like (Join-Path $env:TEMP '*') -and -not $Force) {
+    Write-Host ('X 当前运行位置是临时目录：' + $PSScriptRoot)
+    Write-Host '  从这里注册开机自启会把任务写死到临时目录（重启后目录可能已被清理）→ 已拒绝。'
+    Write-Host '  请在正式安装目录里运行；确实要这么做请加 -Force。'
+    exit 1
+  }
   $exe = Find-DshExe
   if (-not $exe) { Write-Host '❌ 找不到 DSH 主程序，无法设置（先启动一次 DSH 再试）'; exit 1 }
   if (-not (Test-Path -LiteralPath $vbs)) { Write-Host ("❌ 缺少 {0}" -f $vbs); exit 1 }

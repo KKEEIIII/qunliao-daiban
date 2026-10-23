@@ -465,6 +465,29 @@ foreach ($spec in $taskSpecs) {
   }
 }
 
+# ---------- 4b. 开机自启指向（2026-10-23 加） ----------
+# 为什么要有这条：实测出现过"任务被从 %TEMP% 的临时解压副本注册"，目录删掉后
+#   开机启动静默失败（任务结果=1），而用户看到的现象是"开机打开的还是老版本/根本没启动"。
+try {
+  $bootTask = Get-ScheduledTask -TaskName 'DSH-开机自启' -ErrorAction SilentlyContinue
+  if (-not $bootTask) {
+    Add-Check '开机自启' 'green' '未启用（不影响采集/提醒；想开机免手动启动就运行 dsh-接入\开机自启DSH.ps1 -Enable）'
+  } else {
+    $barg = [string](($bootTask.Actions | Select-Object -First 1).Arguments)
+    $wantPs1 = Join-Path $ws 'dsh-接入\开机自启DSH.ps1'
+    $bHere = $barg -and $barg.Contains($wantPs1)
+    $bm = [regex]::Match($barg, '"([^"]+\.vbs)"')
+    $bVbsOk = if ($bm.Success) { Test-Path -LiteralPath $bm.Groups[1].Value } else { $false }
+    if ($bHere -and $bVbsOk) {
+      Add-Check '开机自启' 'green' ('指向本机当前版本（' + $bootTask.State + '）')
+    } elseif (-not $bVbsOk) {
+      Add-Check '开机自启' 'yellow' ('任务指向的 vbs 已不存在 → 开机启动会静默失败。指向：' + $barg + '｜修：跑 dsh-接入\开机自启DSH.ps1 -Enable')
+    } else {
+      Add-Check '开机自启' 'yellow' ('任务指向的不是当前版本（开机可能拉起旧版本）：' + $barg + '｜修：跑 dsh-接入\开机自启DSH.ps1 -Enable')
+    }
+  }
+} catch { Add-Check '开机自启' 'yellow' ('检查失败：' + $_.Exception.Message) }
+
 # ---------- 5. 提醒器 ----------
 # ⚠️ 2026-10-15 改进：原来只看 `提醒器.log` 的修改时间，而这个日志**只在真的发出提醒时才写**
 #   → 一整天没有待办到期时，它永远是"很久没动作"的黄灯（典型的假阳性：把"没事可做"说成"可能挂了"）。
