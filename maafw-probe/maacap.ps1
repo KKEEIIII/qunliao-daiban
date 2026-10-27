@@ -38,6 +38,11 @@ public class MaaApi {
   [DllImport("MaaFramework.dll", CallingConvention=CallingConvention.Cdecl)] public static extern ulong MaaImageBufferGetEncodedSize(IntPtr b);
   [DllImport("MaaFramework.dll", CallingConvention=CallingConvention.Cdecl)] public static extern int MaaImageBufferWidth(IntPtr b);
   [DllImport("MaaFramework.dll", CallingConvention=CallingConvention.Cdecl)] public static extern int MaaImageBufferHeight(IntPtr b);
+  // 2026-10-26 加：截图尺寸配置（MaaFramework 官方 API，见 docs/zh_cn/2.2-集成接口一览.md 的 MaaControllerSetOption）
+  //   key=1 ScreenshotTargetLongSide（int32）｜key=2 ScreenshotTargetShortSide（int32）
+  //   key=3 ScreenshotUseRawSize（**1 字节 bool**）｜key=6 ScreenshotResizeMethod（int32）
+  //   实测：不设置时抓图被缩到 968x720；设 key=3 → 抓图 1267x942（窗口原始分辨率）
+  [DllImport("MaaFramework.dll", CallingConvention=CallingConvention.Cdecl)] public static extern byte MaaControllerSetOption(IntPtr ctrl, int key, IntPtr value, ulong valSize);
   public static byte[] Png(IntPtr b) {
     IntPtr p = MaaImageBufferGetEncoded(b);
     ulong n = MaaImageBufferGetEncodedSize(b);
@@ -103,6 +108,44 @@ function Close-MaaControllers {
     try { [MaaApi]::MaaControllerDestroy($script:MaaControllers[$k]) } catch {}
   }
   $script:MaaControllers = @{}
+}
+
+function Set-MaaShotOption {
+  <#
+    .SYNOPSIS  设置控制器截图选项（MaaControllerSetOption 封装）
+    .DESCRIPTION
+      2026-10-26 加。为什么需要：Maa 默认把抓图缩到 968x720（窗口 1267x942 时压掉 24%），
+      文字变小 → Windows OCR 漏行/串行（实测"第 一次 月 视频"整行读不出来）。
+      官方 API 支持关掉缩放：
+        Key=1 ScreenshotTargetLongSide  (int32) 长边缩到指定长度
+        Key=2 ScreenshotTargetShortSide (int32) 短边缩到指定长度
+        Key=3 ScreenshotUseRawSize      (**1 字节 bool**) 截图不缩放 → 原始分辨率
+        Key=6 ScreenshotResizeMethod    (int32) 插值方法 0..4，默认 3=INTER_AREA
+      实测 Key=3 传 1 字节 true → 抓图 1267x942（原始分辨率），后台截图能力不变。
+    .PARAMETER AsBool  该选项要 1 字节 bool（Key=3、Key=4 这类），否则按 int32 传
+  #>
+  param(
+    [Parameter(Mandatory = $true)][IntPtr]$Controller,
+    [Parameter(Mandatory = $true)][int]$Key,
+    [int]$IntValue = 0,
+    [switch]$AsBool
+  )
+  if (-not (Initialize-Maa)) { return $false }
+  if ($Controller -eq [IntPtr]::Zero) { return $false }
+  $mem = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+  try {
+    if ($AsBool) {
+      $b = if ($IntValue -ne 0) { [byte]1 } else { [byte]0 }
+      [System.Runtime.InteropServices.Marshal]::WriteByte($mem, $b)
+      return ([MaaApi]::MaaControllerSetOption($Controller, $Key, $mem, [uint64]1) -ne 0)
+    }
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($mem, $IntValue)
+    return ([MaaApi]::MaaControllerSetOption($Controller, $Key, $mem, [uint64]4) -ne 0)
+  } catch {
+    return $false
+  } finally {
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($mem)
+  }
 }
 
 # 后台截图 → 存 PNG，返回 @{ok; w; h; bytes}

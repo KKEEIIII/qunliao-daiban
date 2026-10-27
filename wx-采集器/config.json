@@ -4,6 +4,10 @@
   "chatXFrom": 0.42,
   "headerYTo": 0.16,
   "rowGap": 35,
+  "autoRowGap": true,
+  "_notes_rowGap": "会话行距阈值（窗口像素，标定于本机 894x647 窗口）。2026-10-27 起默认 autoRowGap=true：按 OCR 行距自动校准（换分辨率/DPI/字号都不用重标），这里的 35 只作为候选阈值之一、以及自动校准失败时的兜底。实测：同一份 OCR 缩放到 0.5×/2× 时，固定 35 会把 6 个会话并成 2 个 / 拆成 11 个；自适应在 0.5×~2× 全部给出正确的 6 个。",
+  "clickNameOffset": 0.55,
+  "_notes_clickNameOffset": "点开会话时的纵向偏移 = 该行名字的字高 × 这个比例（默认 0.55 → 名字 15px 时约 8px，与原来的定值 +8 一致）。换 DPI/字号会同比缩放，不用重标。",
   "clickX": 0.25,
   "clickSettleMs": 1100,
   "ignoreChats": [
@@ -56,5 +60,15 @@
   "historySettleMs": 350,
   "historyMaxLines": 150,
   "_notes_history": "往期记录（2026-10-18）：点开会话后，光标移到聊天区、滚轮向上翻 historyScreens 屏，每屏截图 OCR，用\"尾/头重叠\"去重后合并；翻完自动滚回底部还原视图。0 = 关闭（只读当前可见屏）。historyMaxLines = 合并后最多保留多少行（保护 token）。代价：每屏约 0.6~1 秒。",
+  "_notes_broadcast": "2026-10-26：白名单内所有群的 mention 规则都识别这些\"告知所有人\"的词；Test-BroadcastKeyword 另内置同一套 + OCR 容错，这里写出来是为了日志可读",
+  "bgClick": "auto",
+  "maaInputMethod": 4,
+  "_notes_bgClick": "auto=能用 Maa 后台点击就用(不抢焦点/不动鼠标)，失败自动退回真实鼠标；off=强制真实鼠标",
+  "_notes_maaInputMethod": "2=SendMessage 4=PostMessage(默认,更轻) 1024=AnchoredTouch",
+  "historyMaxScreens": 40,
+  "historyUntilAnchor": true,
+  "_notes_historyScreens": "第一次采某个群（还没有锚点）时翻几屏",
+  "_notes_historyMaxScreens": "有锚点后一直翻到锚点为止，这是防死循环的硬上限",
+  "_notes_historyUntilAnchor": "true=翻到上次记录的边界才停（避免漏消息）；false=只翻 historyScreens 屏",
   "_设置说明": "myAliases：填你自己的微信昵称（用来识别\"@我\"，可多个）。groupWhitelist：要盯的群名（留空=所有会话）。mentionOnly：true=只收提到我的消息。chatRules：按群定制规则，见 使用手册.md"
 }

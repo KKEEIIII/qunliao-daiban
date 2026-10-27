@@ -68,21 +68,30 @@ function Add-Check([string]$name, [string]$level, [string]$detail) {
 # 做法：本机版本（版本.txt）vs GitHub 最新 Release 的 tag。
 #   · 查不到（离线/网络受限）→ 不报错，只写"未能检查更新"（离线用户不该被吓）
 #   · 结果写进 群聊待办\最新版本提示.txt → 看板页/控制台页会读它并显示横幅
-$instVer = ''
-$verTxtPath = Join-Path $ws '版本.txt'
-if (-not (Test-Path -LiteralPath $verTxtPath)) {
-  # 开发工作区里没有根目录 版本.txt（它只打进包里）→ 回退找 发布\ 下的
-  $altVer = Join-Path $ws '发布\版本.txt'
-  if (Test-Path -LiteralPath $altVer) { $verTxtPath = $altVer }
-}
-if (Test-Path -LiteralPath $verTxtPath) {
-  $mv = [regex]::Match([System.IO.File]::ReadAllText($verTxtPath, [System.Text.Encoding]::UTF8), '(?m)^版本\s*:\s*(\S+)')
-  if ($mv.Success) { $instVer = $mv.Groups[1].Value.Trim() }
-}
+# 2026-10-23：开发工作区（直接从工作区跑的模式）根目录没有 版本.txt，只有打包产物里才有。
+#   原来只回退找 发布\版本.txt，结果本机版本永远为空 → 下面"最新/本机都非空"不成立
+#   → 连网络请求都不发，横幅永远 UNKNOWN（表现为"离线"，实际网络是好的）。
+#   修法：按候选列表找，取版本号最大的那份（顺手防 发布\_github-src 是旧版时的误报）。
 function Convert-VerKey([string]$v) {
   $m = [regex]::Match($v, 'v?(\d{8})-(\d{4})')
   if ($m.Success) { return [long]($m.Groups[1].Value + $m.Groups[2].Value) }
   return [long]0
+}
+$instVer = ''
+$instKey = [long]0
+$verCandidates = @(
+  (Join-Path $ws '版本.txt'),                  # 装好的机器：安装根目录
+  (Join-Path $ws '发布\版本.txt'),             # 打包现场
+  (Join-Path $ws '发布\_github-src\版本.txt')  # 开发工作区（源码镜像里带一份）
+)
+foreach ($vc in $verCandidates) {
+  if (-not (Test-Path -LiteralPath $vc)) { continue }
+  try { $vtxt = [System.IO.File]::ReadAllText($vc, [System.Text.Encoding]::UTF8) } catch { continue }
+  $mv = [regex]::Match($vtxt, '(?m)^版本\s*:\s*(\S+)')
+  if (-not $mv.Success) { continue }
+  $v = $mv.Groups[1].Value.Trim()
+  $k = Convert-VerKey $v
+  if ($v -and $k -gt 0 -and $k -ge $instKey) { $instVer = $v; $instKey = $k }
 }
 $latestVer = ''
 try {

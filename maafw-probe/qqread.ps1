@@ -48,8 +48,25 @@ function Start-QqRead {
   if (-not $win) { return [pscustomobject]@{ ok = $false; reason = '没找到真实 QQ 窗口（面板没开 / 全部候选截出来是空白）'; win = $null } }
   if (-not (Initialize-Maa)) { return [pscustomobject]@{ ok = $false; reason = 'MaaFramework 初始化失败'; win = $win } }
   $method = if ($Config.maaInputMethod) { [uint64]$Config.maaInputMethod } else { [uint64]1024 }
-  $ctrlShot = Get-MaaController -Hwnd $win.hwnd -Screencap 0x12
+  # 截图方式（2026-10-26 查官方文档 + 实测）：
+  #   0x12 = FramePool|PrintWindow = 官方 MaaWin32ScreencapMethod_Background（支持后台，默认用它）
+  #   0x04 = DXGI_DesktopDup，**不支持后台**，且抓出来是变形图（横向1:1、纵向压缩）→ 不要用
+  $scMode = if ($Config.maaScreencap) { [uint64]$Config.maaScreencap } else { [uint64]0x12 }
+  $ctrlShot = Get-MaaController -Hwnd $win.hwnd -Screencap $scMode
+  # 截图不缩放（2026-10-26 查官方 API MaaControllerSetOption 找到的）：
+  #   默认 Maa 把抓图缩到 968x720，窗口 1267x942 时纵向压掉 24% → 文字变小 → OCR 漏行
+  #   （实测「第 一 次 月 视 频」整行读不到，示例群I群每轮漏采）。
+  #   官方 ScreenshotUseRawSize（key=3，1 字节 bool）关掉缩放 → 抓图 1267x942 原始分辨率，
+  #   而且**仍然是后台截图**，不用改用户窗口大小。
+  #   配置 maaRawSize=false 可关掉（万一某些机器抓图过大导致慢/失败）。
+  $useRaw = if ($Config.PSObject.Properties['maaRawSize']) { [bool]$Config.maaRawSize } else { $true }
+  if ($useRaw -and $ctrlShot -ne [IntPtr]::Zero) { [void](Set-MaaShotOption -Controller $ctrlShot -Key 3 -IntValue 1 -AsBool) }
   $ctrlClick = Get-MaaController -Hwnd $win.hwnd -InputMethod $method
+  # ⚠️ 2026-10-26 关键 bug 修复：**点击控制器也必须设成原始尺寸**。
+  #   抓图和点击是两个不同的控制器；之前只给抓图设了 raw，点击控制器仍以为图是 968x720，
+  #   于是它把抓图坐标按 942/720=1.308 放大后才点 → 点 y=174 实际落到 y≈228，
+  #   表现为"点示例部门示例机构却打开示例学校新闻"。两个控制器都设成 raw，坐标才是 1:1。
+  if ($useRaw -and $ctrlClick -ne [IntPtr]::Zero) { [void](Set-MaaShotOption -Controller $ctrlClick -Key 3 -IntValue 1 -AsBool) }
   if ($ctrlShot -eq [IntPtr]::Zero -or $ctrlClick -eq [IntPtr]::Zero) {
     return [pscustomobject]@{ ok = $false; reason = 'Maa 控制器连接失败'; win = $win }
   }
@@ -152,16 +169,30 @@ function Get-QqSessionRows {
 function Get-QqChatHeader {
   <#
     .SYNOPSIS  从抓图 OCR 里取"聊天区标题"（完整群名）
+    .DESCRIPTION
+      2026-10-27 修：原来取**最长**的那一行，于是群里有"置顶公告"时会把公告当群名 ——
+      实测「示例学校新闻」那一屏：标题 `示例群D（156）` 在 y≈0.070H，
+      置顶公告 `万众待的年度剧场活动一一《剧院启幕计划》…正式拉开帷幕！` 在 y≈0.122H、比标题长一倍，
+      结果头部被认成公告 → 判"不在白名单" → 这个群一直采不到。
+      现在改成取**最靠上**的那一行（标题永远在聊天区最上面，公告/侧栏都在下面），
+      并且右侧成员栏（x > chatXTo）不再参与（原来没有上界，成员名也可能被当标题）。
   #>
   param([Parameter(Mandatory = $true)]$Ctx, [Parameter(Mandatory = $true)]$Rows)
   $W = $Ctx.captureW; $H = $Ctx.captureH
+  $cfg = $Ctx.cfg
+  $xMax = if ($cfg -and $cfg.chatXTo) { $W * [double]$cfg.chatXTo } else { $W }
   $best = ''
+  $bestY = [double]::MaxValue
   foreach ($r in ($Rows | Sort-Object y)) {
     $t = ($r.text -replace ' ', '')
-    if ($r.x -lt ($W * 0.26)) { continue }
-    if ($r.y -lt ($H * 0.05) -or $r.y -gt ($H * 0.16)) { continue }
     if ($t.Length -lt 3) { continue }
-    if ($t.Length -gt $best.Length) { $best = $t }
+    if ($r.x -lt ($W * 0.26) -or $r.x -gt $xMax) { continue }
+    if ($r.y -lt ($H * 0.05) -or $r.y -gt ($H * 0.16)) { continue }
+    # 取最靠上的；同一 y 附近取更长的（标题一行可能有多个 OCR 片段）
+    if ($r.y -lt ($bestY - 6) -or ($r.y -le ($bestY + 6) -and $t.Length -gt $best.Length)) {
+      $best = $t
+      $bestY = [double]$r.y
+    }
   }
   return $best
 }
@@ -175,7 +206,31 @@ function Get-QqChatText {
   $x1 = $W * [double]$cfg.chatXFrom
   $x2 = if ($cfg.chatXTo) { $W * [double]$cfg.chatXTo } else { $W }
   $y1 = $H * [double]$cfg.chatYFrom
-  $lines = @($Rows | Where-Object { $_.x -ge $x1 -and $_.x -le $x2 -and $_.y -ge $y1 } | Sort-Object y)
+  $y2 = if ($cfg.chatYTo) { $H * [double]$cfg.chatYTo } else { $H }
+  $lines = @($Rows | Where-Object { $_.x -ge $x1 -and $_.x -le $x2 -and $_.y -ge $y1 -and $_.y -le $y2 } | Sort-Object y)
+  # 2026-10-27：过滤界面噪声行。实测 QQ 聊天区 OCR 会混进按钮/图标文字
+  #   （"0"、"回"、"裔"、"0031" 这类），以及成员侧栏的短标签 —— 原来全都被拼进正文，
+  #   示例群B 那条 148 字里有一半是这种噪声，模型抽取时会把它们当消息内容。
+  # 判据保守：只丢"去掉标点后长度 < 2"和"纯数字/纯符号"的行，正文不会被误伤。
+  $kept = @()
+  foreach ($ln in $lines) {
+    $t0 = ($ln.text -replace ' ', '')
+    if ($t0.Length -ge 2) {
+      $hasCjk = [regex]::IsMatch($t0, '[\u4e00-\u9fff]')
+      $hasWord = [regex]::IsMatch($t0, '[A-Za-z]{2,}')
+      if ($hasCjk -or $hasWord) { $kept += $ln; continue }
+    }
+    # 极短但确实可能是聊天内容（如"好"、"1"）——留着，但只留一个字符的中文
+    if ($t0.Length -eq 1 -and [regex]::IsMatch($t0, '[\u4e00-\u9fff]')) { $kept += $ln; continue }
+    # ⚠️ 2026-10-27：**整行就是时间的行必须留下**。
+    #   聊天区的"时间分隔行"里，只有"昨天19：22 / 星期五23:38"带中文；
+    #   纯时分的（如 "09:05"、"9:5"）在 OCR 里没有中文也没有字母 → 会被上面两道判据当噪声丢掉，
+    #   于是新的时间锚点（文本+时间）永远看不到这类分隔行 → 翻页停不下、"没有新消息"也判不出来。
+    #   判据用严格整行匹配（ConvertFrom-ChatTimeText 内部就是 ^...$），正文里的
+    #   "活动时间19：00—21：00" 不会被当时间行。
+    if (ConvertFrom-ChatTimeText -Text ([string]$ln.text)) { $kept += $ln; continue }
+  }
+  $lines = @($kept)
   $text = (($lines | ForEach-Object { ($_.text -replace ' ', '') }) -join "`n").Trim()
   return [pscustomobject]@{ text = $text; lines = $lines; chars = $text.Length }
 }

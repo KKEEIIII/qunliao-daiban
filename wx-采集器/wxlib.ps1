@@ -293,7 +293,7 @@ function Test-WxNonChatHeader {
   if ([string]::IsNullOrWhiteSpace($Header)) { return $false }
   $h = $Header -replace '\s', ''
   # ⚠️ **只用名字标记白名单**，不用"尾部带 (数字)"这种形态启发式 ——
-  #    实测「理综6班-勇往直前（25）」是**正常群名**（括号里是群人数），
+  #    实测「示例群G-勇往直前（25）」是**正常群名**（括号里是群人数），
   #    形态启发式会把它误判成"群助手"，触发返回 → **把正常群踢掉，比不返回更糟**。
   #    所以这里宁可漏判（漏判 = 回到现状：按实际群的规则过滤，不丢数据），也绝不误判。
   #    标记可通过 config 的 nonChatMarkers 扩展（可把 OCR 常见错字写法也写进去）。
@@ -557,7 +557,7 @@ function Test-ChatRuleMatch {
       实测**匹配不上**：该残名比规则**短 1 个字符**（10 vs 11），③ 的长度门槛先挡住了；
       而且它与规则的编辑距离是 3（超出 ≤1 的容差）。这是**已知限制**，不是回归：
       旧版（1402~1620）同样匹配不上。真正需要覆盖这类残名时，应把「白名单写短一点」
-      （例如写 "26人工智能" 或带数字的短形式），而不是放宽 ③ 的容差 ——
+      （例如写 "26示例群A" 或带数字的短形式），而不是放宽 ③ 的容差 ——
       放宽容差会把不相干的群也匹配进来（实测 "999123" 对 "123" 这种已经因 ① 命中）。
   #>
   param([string]$Name, [string]$Pattern)
@@ -647,13 +647,145 @@ function Test-ChatKeyword {
   return $false
 }
 
+# ==================== 群名匹配（微信 / QQ 共用，2026-10-26） ====================
+# 白名单既支持"短关键词"（示例群F/示例部门/某学校/示例群B/示例群I/<示例群号>），也支持完整群名。
+# OCR 会把群名读残，所以四路依次尝试（与 QQ 侧原来的 Test-QqMatch 语义一致）：
+#   ① 包含             —— 短关键词最常用（"示例群F" ⊂ "…学院示例群F培训"）
+#   ② 数字前缀         —— 白名单里的数字串，以名字里的数字串开头（<示例群号> ← 266）
+#   ③ 开头文字容错     —— 只对 ≥4 字的长名启用：比较开头 min(6, |规则|) 个字，编辑距离≤容差
+#                        （OCR 常把开头几个字读错，如"示例学校新闻"读成"示例学校新闻新闻"）
+#   ④ 滑窗编辑距离≤容差 —— 长名容差 2、短名（≤4 字）容差 1，兜住中间某几个字的错字
+# 注意：③ 不对 2~3 字短词启用，否则"示例群F"会误命中"团建"之类；短词靠 ①/④。
+function Get-ChatNameTolerance([int]$len) {
+  # 短名（≤5 字）只容 1 个错字；6 字以上容 2 个 —— 实测 "26人工2紐开级群" 与
+  # "示例群A" 的开头 6 字差 2 个字（智能→2紐），容 1 会漏掉整个群。
+  if ($len -ge 6) { return 2 }
+  return 1
+}
+
+function Test-ChatNameMatch {
+  param([string]$Name, [string]$Pattern)
+  $n = if ($null -eq $Name) { '' } else { ($Name -replace '\s', '') }
+  $p = if ($null -eq $Pattern) { '' } else { ($Pattern -replace '\s', '') }
+  if ($p.Length -lt 2 -or $n.Length -lt 2) { return $false }
+  # ① 包含
+  if ($n.Contains($p)) { return $true }
+  # ② 数字前缀
+  $pd = ([regex]::Match($p, '\d{3,}')).Value
+  if ($pd) {
+    foreach ($m in [regex]::Matches($n, '\d{3,}')) {
+      if ($pd.StartsWith($m.Value)) { return $true }
+    }
+  }
+  # ③ 开头文字容错（长名才启用）
+  if ($p.Length -ge 4) {
+    $pn = [Math]::Min(6, $p.Length)
+    $nn = [Math]::Min($pn, $n.Length)
+    if ($nn -ge 2) {
+      if ((Get-ChatLevenshtein $n.Substring(0, $nn) $p.Substring(0, $pn)) -le (Get-ChatNameTolerance $nn)) { return $true }
+    }
+  }
+  # ④ 滑窗编辑距离
+  if ($n.Length -ge $p.Length) {
+    $tol = Get-ChatNameTolerance $p.Length
+    for ($i = 0; $i -le ($n.Length - $p.Length); $i++) {
+      if ((Get-ChatLevenshtein $n.Substring($i, $p.Length) $p) -le $tol) { return $true }
+    }
+  }
+  return $false
+}
+
+# ==================== 两个名字是不是同一个群（2026-10-27）====================
+# 为什么需要：同一个群，**列表行 OCR 名** 与 **点开后的聊天头部** 经常差一两个字
+#   （实测「26 人工 2 毋开级群」vs「26 人工 2 班<OCR 错字示例>（50）」）→ 原来用"包含"判断，
+#   于是 verified=false；而两张截图之间同一行的名字也会变（「…2 班…」→「…2 班灬」）
+#   → 抓取时"重新截图后列表里找不到它"，那一轮就少点一个群。
+# 判据按可靠性排序（**不能只用包含**：「示例部门」⊂「示例部门小组」，但它们是两个群）：
+#   ① 归一化后完全相同
+#   ② 共同前缀 ≥6 个字（列表行名被截断的典型形态）
+#   ③ 白名单**稳定标识**相同（Get-ChatStableKey 取最长命中，能区分「示例部门」和「示例部门小组」）
+#   ④ 双方归一化后都 ≥4 字、长度差 ≤1、编辑距离 ≤1（纯 OCR 错一两个字；短名不参与，避免误判）
+# 返回 @{ same; why }：why 会写进日志，排障时能看出"凭什么认为它是同一个群"。
+function Get-ChatMatchInfo {
+  param([string]$A, [string]$B, [string[]]$Whitelist = @())
+  $clean = { param($s) if ($null -eq $s) { return '' } return (($s -replace '\s', '') -replace '[：:，。、．（）()【】\[\]“”"''·]', '') }
+  $na = & $clean $A
+  $nb = & $clean $B
+  if ($na.Length -lt 2 -or $nb.Length -lt 2) { return [pscustomobject]@{ same = $false; why = '名字太短或为空' } }
+  if ($na -eq $nb) { return [pscustomobject]@{ same = $true; why = '完全相同' } }
+  # ② 共同前缀足够长、且**不是"短名正好是长名的完整前缀"** → 多半是**列表行名被截断**
+  #   （真机实测：列表行只读到「26 示例群A 2 班灬」，点开后头部是完整的
+  #    「26 示例群A 2 班 <示例群号>（官方）（52）」，共同前缀 8 个字后第 9 个字开始不同）。
+  #   ⚠️ 排除"完整前缀"是为了别把「DeepSeek」和「DeepSeek AI」判成同一个（它们可能是两个会话）；
+  #   「示例部门·示例群C」和「示例部门小组」只共同前缀 3 个字，也不会被误判。
+  $common = 0
+  $lim = [Math]::Min($na.Length, $nb.Length)
+  while ($common -lt $lim -and $na[$common] -eq $nb[$common]) { $common++ }
+  $shorterIsPrefix = ($na.Length -le $nb.Length -and $nb.StartsWith($na)) -or ($nb.Length -le $na.Length -and $na.StartsWith($nb))
+  if ($common -ge 6 -and -not $shorterIsPrefix) { return [pscustomobject]@{ same = $true; why = ('名字共同前缀 ' + $common + ' 个字（列表行名多半被截断）') } }
+  if ($Whitelist.Count -gt 0) {
+    $ka = Get-ChatStableKey -Name $A -Whitelist $Whitelist
+    $kb = Get-ChatStableKey -Name $B -Whitelist $Whitelist
+    $ia = $false; $ib = $false
+    foreach ($w in $Whitelist) {
+      $wn = ([string]$w -replace '\s', '')
+      if (-not $wn) { continue }
+      if ($wn -eq $ka) { $ia = $true }
+      if ($wn -eq $kb) { $ib = $true }
+    }
+    if ($ia -or $ib) {
+      if ($ka -eq $kb) { return [pscustomobject]@{ same = $true; why = ('同一白名单群「' + $ka + '」') } }
+      return [pscustomobject]@{ same = $false; why = ('分属不同白名单群（' + $ka + ' / ' + $kb + '）') }
+    }
+  }
+  if ($na.Length -ge 4 -and [Math]::Abs($na.Length - $nb.Length) -le 1) {
+    if ((Get-ChatLevenshtein $na $nb) -le 1) { return [pscustomobject]@{ same = $true; why = '编辑距离≤1（OCR 错字）' } }
+  }
+  return [pscustomobject]@{ same = $false; why = '既不是同一白名单群、也不像同一个名字' }
+}
+
+# ==================== "告知所有人"关键词（微信 / QQ 共用，2026-10-26） ====================
+# 用户要求：白名单内所有群都要能识别 @全体成员 / @所有人 / 我们 / 大家 / 同学们 这类
+# "对所有人说"的信号（OCR 常把 @全体成员 读成 @全体成员/@ 全 体 成 员/@斫有人 等）。
+# 匹配方式：去空格后 ① 包含；② 2~4 字短词在文本里滑窗编辑距离≤1（容 OCR 错字）。
+function Get-BroadcastKeywords {
+  return @(
+    '@全体成员', '@所有人', '@全部成员', '@全员', '@全体', '@所有',
+    '全体成员', '所有人', '全部成员', '全员',
+    '全体同学', '各位同学', '同学们', '大家', '我们', '各位'
+  )
+}
+
+function Test-BroadcastKeyword {
+  param([string]$Text, [string[]]$ExtraKeywords = @())
+  $t = if ($null -eq $Text) { '' } else { ($Text -replace '\s', '') }
+  if ($t.Length -eq 0) { return $false }
+  $kws = @(Get-BroadcastKeywords) + @($ExtraKeywords | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+  # ① 包含
+  foreach ($k in $kws) {
+    $kk = ([string]$k -replace '\s', '')
+    if ($kk.Length -ge 2 -and $t.Contains($kk)) { return $true }
+  }
+  # ② 短词 OCR 容错（滑窗编辑距离≤1）
+  foreach ($k in $kws) {
+    $kk = ([string]$k -replace '\s', '')
+    if ($kk.Length -lt 2 -or $kk.Length -gt 4) { continue }
+    if ($t.Length -lt $kk.Length) { continue }
+    for ($i = 0; $i -le ($t.Length - $kk.Length); $i++) {
+      if ((Get-ChatLevenshtein $t.Substring($i, $kk.Length) $kk) -le 1) { return $true }
+    }
+  }
+  return $false
+}
+
 # 只保留命中关键词的行（并带上上一行作为上下文，通常是发言人）
+# 2026-10-26：命中判定改用 Test-BroadcastKeyword —— 自动包含"告知所有人"全套词 + OCR 容错。
 function Select-KeywordLines {
   param($Lines, [string[]]$Keywords)
   $out = @()
   $sorted = @($Lines | Sort-Object y)
   for ($i = 0; $i -lt $sorted.Count; $i++) {
-    if (Test-ChatKeyword $sorted[$i].t $Keywords) {
+    if (Test-BroadcastKeyword -Text $sorted[$i].t -ExtraKeywords $Keywords) {
       if ($i -gt 0) { $out += $sorted[$i - 1] }
       $out += $sorted[$i]
     }
@@ -719,16 +851,65 @@ function Merge-ChatScreens {
 #   继续翻只会把同一批历史重新 OCR（费时、费 token，还可能让模型重复抽同一条待办）。
 # 做法：记录落盘时把合并结果的"最旧 3 行"存成锚点（state\seen-anchors.txt，TSV：key<TAB>规范化行）；
 #   翻页时每读一屏就比对锚点，命中即停。
+# 2026-10-27 升级：锚点 = **文本 + 时间**（3 列：key<TAB>ISO时间<TAB>行）。
+#   为什么：只比文本时，OCR 只要抖一两个字就永远命不中 → 白翻到硬上限 40 屏；
+#   而"翻到时间 ≤ 上次锚点时间"这条判据不受 OCR 抖动影响（用户原话要求）。
+#   旧文件是 2 列，读方兼容（Get-ChatAnchorRecords 里 time=$null，退化成纯文本锚点）。
 function Get-ChatAnchorLines {
-  param([string]$AnchorFile, [string]$Key)
+  # 2026-10-27：只返回"行文本"（老行为不变，所有旧调用点都不用改）。
+  #   带时间的完整记录用 Get-ChatAnchorRecords（下面），这里只是它的薄包装。
+  param([string]$AnchorFile, [string]$Key, [string]$Fuzzy = '', [string[]]$Whitelist = @())
+  $recs = @(Get-ChatAnchorRecords -AnchorFile $AnchorFile -Key $Key -Fuzzy $Fuzzy -Whitelist $Whitelist)
+  return @($recs | ForEach-Object { $_.line })
+}
+
+function Get-ChatAnchorRecords {
+  <#
+    .SYNOPSIS  读某个 key 的锚点记录（key + 时间 + 行文本），兼容旧的 2 列格式
+    .DESCRIPTION
+      seen-anchors.txt 的两种行格式：
+        2 列（2026-10-19 起）：key<TAB>规范化行
+        3 列（2026-10-27 起）：key<TAB>ISO时间<TAB>规范化行
+      旧行没有时间 → time = $null（照样能用文本锚点，只是少了时间判据，行为与升级前一致）。
+      key 匹配规则与以前完全一致：先精确命中，再按"归属标识"模糊命中（OCR 群名抖动产生的旧 key）。
+      ⚠️ 不要给这个函数改名成 Get-ChatAnchorLines 的重载：PowerShell 没有函数重载，
+         同名会互相覆盖（采集器里还 dot-source 了别的库）。
+    .OUTPUTS  @( [pscustomobject]@{ key; time([datetime] 或 $null); line } )
+  #>
+  param([string]$AnchorFile, [string]$Key, [string]$Fuzzy = '', [string[]]$Whitelist = @())
   if ([string]::IsNullOrWhiteSpace($Key) -or -not (Test-Path -LiteralPath $AnchorFile)) { return @() }
-  $out = @()
+  $exact = @()
+  $fuzzyHit = @()
+  $fz = ($Fuzzy -replace '\s', '')
   foreach ($ln in [System.IO.File]::ReadAllLines($AnchorFile, [System.Text.Encoding]::UTF8)) {
-    $i = $ln.IndexOf([char]9)
-    if ($i -lt 0) { continue }
-    if ($ln.Substring(0, $i) -eq $Key) { $out += $ln.Substring($i + 1) }
+    if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+    $parts = $ln -split "`t"
+    if ($parts.Count -lt 2) { continue }
+    $k = $parts[0]
+    $t = $null
+    if ($parts.Count -ge 3) {
+      # 3 列：key<TAB>time<TAB>line（line 里理论上没有 TAB，保险起见把后面的都当 line）
+      $line = ($parts[2..($parts.Count - 1)] -join "`t")
+      $t = ConvertTo-ChatAnchorTimeText -Value $parts[1]
+    } else {
+      $line = $parts[1]
+    }
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $rec = [pscustomobject]@{ key = $k; time = $t; line = $line }
+    if ($k -eq $Key) { $exact += $rec; continue }
+    # 2026-10-26 兼容旧数据：以前 key 用的是**OCR 读出来的群名**，同一个群会因为 OCR 抖动
+    #   散成好几个 key（实测 "示例群B（159）" / "示例群B有集团（159）" 是同一个群）。
+    #   现在优先用稳定标识做 key，但旧数据不能丢 → 允许"这条旧 key 属于同一个群"时也算命中。
+    if ($fz.Length -lt 2) { continue }
+    $bare = $k -replace '^(qq|wx)\|', ''
+    $owner = if ($Whitelist.Count -gt 0) { Get-ChatStableKey -Name $bare -Whitelist $Whitelist } else { $bare }
+    # ⚠️ 必须比"归属标识"，不能只比"包含"：否则标识「示例部门」会把「示例部门小组」的锚点也捞过来，
+    #   两个群的边界混在一起 → 翻页提前停或停不下来。
+    if (($owner -replace '\s', '') -eq $fz) { $fuzzyHit += $rec }
   }
-  return $out
+  # 精确命中优先：同一个群已有新格式 key 时，不要混进旧 key 的锚点（避免拿错边界）
+  if ($exact.Count -gt 0) { return $exact }
+  return $fuzzyHit
 }
 
 function Test-ChatAnchorHit {
@@ -748,8 +929,139 @@ function Test-ChatAnchorHit {
   return $false
 }
 
+# ==================== 时间锚点（2026-10-27）====================
+# 用户要求（原话）：「找聊天待办的时候需要知道执行命令的时间，并且理解上一次锚点群聊信息发送的时间，
+#   在上一次锚点时间之后开始抓取，避免错过消息；可以不止用相同消息来确认，时间也要作为确认锚点的一部分；
+#   如果当前界面的时间是上一次锚点的时间则不用向上翻滚。」
+# 落地：
+#   ① 时间分隔行 → 绝对时间（相对时间一律以**本轮执行时间**为基准，不能拿"现在"算）；
+#   ② 锚点记录多一列时间（3 列），翻页时"文本命中 或 时间越过"都算到达边界；
+#   ③ 当前屏最新时间 ≤ 锚点时间 → 没有新消息，一次滚轮都不发。
+#
+# ⚠️ 核心陷阱（真实日志）：正文里也有 HH:mm，例如 10:05 那轮出现过
+#   「头部'10：10一11：50' 不在白名单」，那是公告里的**时间段**，不是时间戳。
+#   所以下面所有正则都是 ^...$：只认"整行就是时间"，绝不能用"包含 \d+:\d+ 就当时间戳"。
+# ⚠️ QQ 的 OCR 噪声（实测）：全角冒号「：」、冒号被读成「℃」（日志原样：「星期五23℃8」）、
+#   冒号整个丢失（锚点文件里真有「昨天2333」）、分钟掉一位（「23:8」）。
+#   容错这些，但保持"整行匹配"这条底线。
+function ConvertTo-ChatAnchorTimeText {
+  <#
+    .SYNOPSIS  把锚点文件里的时间列（ISO 串 / 手写日期串 / datetime / 空）统一成 [datetime] 或 $null
+  #>
+  param([object]$Value)
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [datetime]) { return $Value }
+  $s = ([string]$Value).Trim()
+  if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+  $d = [datetime]::MinValue
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  # ① 标准往返格式（我们自己写的 ToString('o')）
+  if ([datetime]::TryParse($s, $inv, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$d)) { return $d }
+  # ② 手工改文件时常见的写法（2026-10-26 19:22 / 2026/10/26 19:22）
+  if ([datetime]::TryParse($s, $inv, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return $d }
+  return $null
+}
+
+function ConvertFrom-ChatTimeText {
+  <#
+    .SYNOPSIS  把聊天区里的"时间分隔行"解析成绝对时间；不是时间行就返回 $null
+    .DESCRIPTION
+      认这些形态（**必须整行**，正文里夹着的时分一律不算）：
+        昨天19:22 / 今天9:05 / 前天22:54          → 按 -Now 推相对日
+        昨天2333（OCR 丢了冒号）
+        10月26日19:22
+        星期五23:38 / 星日07:53（OCR 把"星期"读成"星"）→ 最近的那个该星期几
+        09:05（只有时分）→ 今天；比 -Now 晚 5 分钟以上算昨天
+    .PARAMETER Now  本轮命令的执行时间（相对时间的基准）。**不要传 Get-Date 当"现在"去解析昨天的消息**。
+    .OUTPUTS  [datetime] 或 $null
+  #>
+  param([string]$Text, [datetime]$Now = (Get-Date))
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+  # 容错：去空白、全角冒号→半角、OCR 的 ℃→冒号；严格：下面全是 ^...$
+  $t = (($Text -replace '\s', '') -replace '：', ':') -replace '℃', ':'
+  if ($t.Length -lt 3 -or $t.Length -gt 24) { return $null }
+
+  # A) 相对日 + 时:分
+  $mA = [regex]::Match($t, '^(今天|昨天|前天|今|昨|前)(\d{1,2}):(\d{1,2})$')
+  if ($mA.Success) {
+    $hh = -1; $mi = -1
+    if (-not [int]::TryParse($mA.Groups[2].Value, [ref]$hh)) { return $null }
+    if (-not [int]::TryParse($mA.Groups[3].Value, [ref]$mi)) { return $null }
+    if ($hh -gt 23 -or $mi -gt 59) { return $null }
+    $off = if ($mA.Groups[1].Value -match '前') { -2 } elseif ($mA.Groups[1].Value -match '昨') { -1 } else { 0 }
+    return $Now.Date.AddDays($off).AddHours($hh).AddMinutes($mi)
+  }
+  # B) 相对日 + 4 位时分（冒号被 OCR 吃掉：锚点文件里真有「昨天2333」）
+  $mB = [regex]::Match($t, '^(今天|昨天|前天)(\d{1,2})(\d{2})$')
+  if ($mB.Success) {
+    $hh = -1; $mi = -1
+    if (-not [int]::TryParse($mB.Groups[2].Value, [ref]$hh)) { return $null }
+    if (-not [int]::TryParse($mB.Groups[3].Value, [ref]$mi)) { return $null }
+    if ($hh -gt 23 -or $mi -gt 59) { return $null }
+    $off = if ($mB.Groups[1].Value -match '前') { -2 } elseif ($mB.Groups[1].Value -match '昨') { -1 } else { 0 }
+    return $Now.Date.AddDays($off).AddHours($hh).AddMinutes($mi)
+  }
+  # C) 月日 + 时:分（跨年时算去年）
+  $mC = [regex]::Match($t, '^(\d{1,2})月(\d{1,2})日(\d{1,2}):(\d{1,2})$')
+  if ($mC.Success) {
+    $mo = [int]$mC.Groups[1].Value; $dd = [int]$mC.Groups[2].Value
+    $hh = [int]$mC.Groups[3].Value; $mi = [int]$mC.Groups[4].Value
+    if ($hh -gt 23 -or $mi -gt 59) { return $null }
+    try {
+      $d = New-Object datetime $Now.Year, $mo, $dd, $hh, $mi, 0
+      if ($d -gt $Now.AddMinutes(5)) { $d = $d.AddYears(-1) }
+      return $d
+    } catch { return $null }
+  }
+  # D) 星期几 + 时:分（"星期"常被 OCR 读成"星"）
+  $mD = [regex]::Match($t, '^(星期|周|星)([一二三四五六日天])(\d{1,2}):(\d{1,2})$')
+  if ($mD.Success) {
+    $hh = [int]$mD.Groups[3].Value; $mi = [int]$mD.Groups[4].Value
+    if ($hh -gt 23 -or $mi -gt 59) { return $null }
+    $dowMap = @{ '一' = 1; '二' = 2; '三' = 3; '四' = 4; '五' = 5; '六' = 6; '日' = 0; '天' = 0 }
+    $dw = [int]$dowMap[$mD.Groups[2].Value]
+    $cur = [int]$Now.DayOfWeek       # Sunday = 0
+    $back = ($cur - $dw + 7) % 7
+    $d = $Now.Date.AddDays(-$back).AddHours($hh).AddMinutes($mi)
+    if ($d -gt $Now.AddMinutes(5)) { $d = $d.AddDays(-7) }
+    return $d
+  }
+  # E) 只有时分（今天）—— 比现在还晚 5 分钟以上的，算昨天
+  $mE = [regex]::Match($t, '^(\d{1,2}):(\d{1,2})$')
+  if ($mE.Success) {
+    $hh = [int]$mE.Groups[1].Value; $mi = [int]$mE.Groups[2].Value
+    if ($hh -gt 23 -or $mi -gt 59) { return $null }
+    $d = $Now.Date.AddHours($hh).AddMinutes($mi)
+    if ($d -gt $Now.AddMinutes(5)) { $d = $d.AddDays(-1) }
+    return $d
+  }
+  return $null
+}
+
+function Get-ChatTimesFromLines {
+  <#
+    .SYNOPSIS  一屏正文里所有时间戳行 → @{ times=@([datetime]…); newest; oldest; count }
+    .DESCRIPTION
+      Lines 可以是字符串数组，也可以是 OCR 行对象（取 .text）。QQ 的 .lines 是对象，微信的是一串字符串，
+      两种都吃。`-Now` 必须是**本轮执行时间**（相对时间靠它解析）。
+  #>
+  param([object[]]$Lines, [datetime]$Now = (Get-Date))
+  $out = New-Object System.Collections.ArrayList
+  foreach ($ln in @($Lines)) {
+    if ($null -eq $ln) { continue }
+    $s = if ($ln -is [string]) { [string]$ln } else { [string]$ln.text }
+    if ([string]::IsNullOrWhiteSpace($s)) { continue }
+    $d = ConvertFrom-ChatTimeText -Text $s -Now $Now
+    if ($d) { [void]$out.Add($d) }
+  }
+  $arr = @($out | Sort-Object)
+  $newest = if ($arr.Count -gt 0) { $arr[$arr.Count - 1] } else { $null }
+  $oldest = if ($arr.Count -gt 0) { $arr[0] } else { $null }
+  return [pscustomobject]@{ times = $arr; newest = $newest; oldest = $oldest; count = $arr.Count }
+}
+
 function Save-ChatAnchors {
-  param([string]$AnchorFile, [string]$Key, [object[]]$Lines, [int]$Take = 3)   # ⚠️ 必须是 object[]：声明成 [string[]] 时 PowerShell 会在进函数前把 OCR 行对象转成字符串
+  param([string]$AnchorFile, [string]$Key, [object[]]$Lines, [int]$Take = 3, [string]$ConsolidateFuzzy = '', [string[]]$ConsolidateWhitelist = @(), [object]$Time = $null)   # ⚠️ 必须是 object[]：声明成 [string[]] 时 PowerShell 会在进函数前把 OCR 行对象转成字符串
   if ([string]::IsNullOrWhiteSpace($Key)) { return }
   # 2026-10-19 修：QQ 的 .lines 是 OCR 行**对象**（@{text=…;x=…}），不是字符串 ——
   #   上一版直接把对象塞进来，锚点存成了 "@{text=26新闻郄怙;x=452;…}"，永远匹配不上。
@@ -767,15 +1079,67 @@ function Save-ChatAnchors {
   $n = [Math]::Min($Take, $norm.Count)
   $first = @($norm[0..($n - 1)])
   $keep = @()
+  $fz = ($ConsolidateFuzzy -replace '\s', '')
+  $dropped = 0
   if (Test-Path -LiteralPath $AnchorFile) {
     foreach ($ln in [System.IO.File]::ReadAllLines($AnchorFile, [System.Text.Encoding]::UTF8)) {
       $i = $ln.IndexOf([char]9)
       if ($i -lt 0) { continue }
-      if ($ln.Substring(0, $i) -ne $Key) { $keep += $ln }
+      $k = $ln.Substring(0, $i)
+      if ($k -eq $Key) { $dropped++; continue }
+      # 2026-10-26：把同一个群的**旧格式 key**（OCR 群名抖动产生的那几个）一并清掉，
+      #   否则同一个群会有 3~4 份锚点、文件越滚越大，还可能拿错边界。
+      #   判定同样比"归属标识"（不能用包含，否则「示例部门」会删掉「示例部门小组」的记录）。
+      if ($fz.Length -ge 2) {
+        $bare = $k -replace '^(qq|wx)\|', ''
+        $owner = if ($ConsolidateWhitelist.Count -gt 0) { Get-ChatStableKey -Name $bare -Whitelist $ConsolidateWhitelist } else { $bare }
+        if (($owner -replace '\s', '') -eq $fz) { $dropped++; continue }
+      }
+      $keep += $ln
     }
   }
-  foreach ($a in $first) { $keep += ($Key + [char]9 + $a) }
+  # 2026-10-27：锚点 = 文本 + 时间。给了 -Time 就写 3 列（key<TAB>ISO时间<TAB>行），
+  #   没给（或给的时间解析不了）就保持旧的 2 列 —— 读方两种都兼容（Get-ChatAnchorRecords）。
+  $timeStr = ''
+  $td = ConvertTo-ChatAnchorTimeText -Value $Time
+  if ($td) { $timeStr = $td.ToString('o') }
+  foreach ($a in $first) {
+    if ($timeStr) { $keep += ($Key + [char]9 + $timeStr + [char]9 + $a) }
+    else { $keep += ($Key + [char]9 + $a) }
+  }
   $dir = Split-Path -Parent $AnchorFile
   if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   [System.IO.File]::WriteAllLines($AnchorFile, $keep, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# ==================== 锚点的稳定标识（2026-10-26）====================
+# 为什么需要：锚点原来的 key 是"OCR 读出来的群名"，而 OCR 每轮都不一样
+#   （实测同一个群散成 "示例群B（159）" / "示例群B有集团（159）" 两个 key），
+#   于是下一轮拿着新群名去查、永远查不到 → 锚点形同失效、每轮都翻到底。
+# 做法：优先用**白名单里命中的那个词**当标识（它在配置里是固定的，不会随 OCR 抖），
+#   取"最长命中"，这样「示例部门小组」不会被更短的「示例部门」抢走。
+#   一个白名单词都没命中时，退回规范化后的群名（至少比原始 OCR 稳一点）。
+function Get-ChatStableKey {
+  param([string]$Name, [string[]]$Whitelist = @())
+  $n = if ($null -eq $Name) { '' } else { ($Name -replace '\s', '') }
+  if ($n.Length -lt 2) { return '' }
+  # ① 先找"直接包含"的白名单词，取最长（「示例部门小组」不会被更短的「示例部门」抢走）
+  $best = ''
+  foreach ($w in $Whitelist) {
+    if ([string]::IsNullOrWhiteSpace($w)) { continue }
+    $wn = ($w -replace '\s', '')
+    if ($wn.Length -lt 2) { continue }
+    if ($n.Contains($wn) -and $wn.Length -gt $best.Length) { $best = $wn }
+  }
+  if ($best) { return $best }
+  # ② 包含不上再用容错匹配：OCR 会把「示例部门小组」读成「26统0部小组」，
+  #    差一个字就退回原始群名的话，这个群的 key 又会随 OCR 抖 → 锚点照样失效。
+  foreach ($w in $Whitelist) {
+    if ([string]::IsNullOrWhiteSpace($w)) { continue }
+    $wn = ($w -replace '\s', '')
+    if ($wn.Length -lt 2) { continue }
+    if ((Test-ChatNameMatch -Name $n -Pattern $wn) -and $wn.Length -gt $best.Length) { $best = $wn }
+  }
+  if ($best) { return $best }
+  return $n
 }

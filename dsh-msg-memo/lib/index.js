@@ -271,7 +271,7 @@ function appendPrefilterAudit(path, dropped, hitsOf) {
 }
 
 // 归一化到"只留中日韩文字+字母数字"，用于"同一条消息被 OCR 读成两种样子"时的模糊去重。
-// 例：'示例群A（52）' 与 '示例群A' 归一后是 '级人工智能班' vs '级人工智能班'
+// 例：'示例群A（52）' 与 '示例群A' 归一后是 '级示例群A班' vs '级示例群A班'
 const normLoose = (s) =>
   String(s ?? '')
     .replace(/[^\u4e00-\u9fff\u3040-\u30ffa-zA-Z0-9]/g, '')

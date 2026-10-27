@@ -36,7 +36,7 @@ const pluginIndex = join(ws, 'dsh-msg-memo', 'lib', 'index.js')
 
 const argv = process.argv.slice(2)
 const CMD = (argv[0] || '').toLowerCase()
-const QUERY = (argv.slice(1).join(' ')).trim()   // 允许"报名表"或"示例学校新闻 电视台"这类带空格的
+const QUERY = (argv.slice(1).join(' ')).trim()   // 允许"报名表"或"示例学校新闻 示例机构"这类带空格的
 const VALID_CMDS = new Set(['list', 'done', 'ignored', 'open', 'add'])
 
 // add 的参数：标题允许空格；`--due <ISO时间>`（形如 2026-10-30T14:00:00+08:00）为可选截止时间
