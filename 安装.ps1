@@ -19,6 +19,7 @@ param(
   [switch]$SkipMaa,       # 跳过 MaaFramework 自动下载（79MB）—— 自测用；不装只是 QQ 退回屏幕模式
   [switch]$SkipProfile,   # 跳过第⑥步（改 profile package.json + junction）—— 打包自测用：自测环境无权写 DSH profile，且验证目标是包内容而非本机 profile
   [switch]$SkipConsole,   # 跳过第⑩步（生成并打开控制台页）—— 自测/无人值守环境用，避免自测时弹浏览器
+  [switch]$WaitSelfCheck, # 第⑨步等自检跑完（默认后台跑，省 1-2 分钟安装时间）
   [switch]$Yes,
   [string]$InstallDir = '',
   [string]$DshDir = '',
@@ -638,13 +639,156 @@ else {
   } catch { Warn ('注册 AUMID 失败（不影响其它功能）：' + $_.Exception.Message) }
 }
 
-Head '⑨ 自检'
-if ($DryRun) { Say '  将运行 dsh-接入\自检.ps1' }
+# ---------------- ⑧.5 布局标定（部署即自适配：不同缩放/不同窗口大小）----------------
+# 为什么放在这里：采集器所有区域边界原来是"窗口宽/高的百分比"，等于假设 UI 随窗口等比缩放。
+#   但微信/QQ 的会话列表是**近似固定像素宽**，窗口一宽比例就失真 —— 外部 125%/150% 实测
+#   "一个群都点不开"就是这条。标定一次，把列表宽度记成 96DPI 下的像素常数，
+#   之后 100%/125%/150%/200% 全部按 常数 × DPI系数 自动换算，换缩放不用重新标定。
+# 标定失败绝不影响安装（微信没开、停在别的页面都会失败）。
+Head '⑧.5 布局标定（让采集适配当前缩放）'
+if ($DryRun) { Say '  将跑 微信/QQ 采集器 -Calibrate' }
+elseif ($SkipTasks) { Warn '-SkipTasks：跳过标定' }
 else {
-  $check = Join-Path $InstallDir 'dsh-接入\自检.ps1'
+  foreach ($app in @(
+      @{ name = '微信'; ps1 = 'wx-采集器\采集器.ps1';    proc = 'Weixin' },
+      @{ name = 'QQ';   ps1 = 'wx-采集器\采集器-QQ.ps1'; proc = 'QQ' }
+    )) {
+    $exe = Join-Path $InstallDir $app.ps1
+    if (-not (Test-Path -LiteralPath $exe)) { continue }
+    $running = @(Get-Process -Name $app.proc -ErrorAction SilentlyContinue).Count -gt 0
+    if (-not $running) { Say ("  {0} 没在运行 → 跳过（以后可单独跑：{1} -Calibrate）" -f $app.name, $app.ps1); continue }
+    try {
+      $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $exe -Calibrate 2>&1 | Out-String
+      $okLine = ($out -split "`n" | Where-Object { $_ -match '列表宽度' } | Select-Object -First 1)
+      if ($okLine) { Ok ("{0} 布局已标定：{1}" -f $app.name, $okLine.Trim()) }
+      else { Warn ("{0} 标定没量到布局（微信/QQ 请停在会话列表页，之后再跑一次 -Calibrate）" -f $app.name) }
+    } catch { Warn ("{0} 标定失败（不影响采集，运行时会按标题条自校准）：{1}" -f $app.name, $_.Exception.Message) }
+  }
+}
+
+Head '⑨ 自检（后台跑，不拖慢安装）'
+# 2026-10-29 实测：完整自检要 101 秒（要查任务/插件/网络/模型额度/通道），
+#   而它只是"装完体检"，不该让用户干等 —— 装一次才 15 秒，却要陪它等 1 分半。
+#   改成后台运行：流程立刻往下走（⑨.5 的轻量检查已覆盖"能不能用"），
+#   完整报告写进 dsh-接入/logs/自检.log（自检脚本自己的日志），控制台页和 2 小时一次的定时自检都会看到。
+#   想在安装时就看结果：加 -WaitSelfCheck。
+if ($DryRun) { Say '  将后台运行 dsh-接入/自检.ps1（不阻塞安装；加 -WaitSelfCheck 才等待）' }
+else {
+  $check = Join-Path $InstallDir 'dsh-接入/自检.ps1'
   if (Test-Path -LiteralPath $check) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $check -Quiet
+    $chkLogDir = Join-Path $InstallDir 'dsh-接入/logs'
+    if (-not (Test-Path -LiteralPath $chkLogDir)) { New-Item -ItemType Directory -Force -Path $chkLogDir | Out-Null }
+    $chkLog = Join-Path $chkLogDir '自检-安装后.log'
+    if ($WaitSelfCheck) {
+      Say '  -WaitSelfCheck：等它跑完（约 1-2 分钟）…'
+      & powershell -NoProfile -ExecutionPolicy Bypass -File $check -Quiet *> $chkLog
+      Ok ('自检结果：' + $chkLog)
+    } else {
+      $vbsC = Join-Path $InstallDir 'dsh-接入/run-hidden.vbs'
+      try {
+        if (Test-Path -LiteralPath $vbsC) {
+          Start-Process -FilePath 'wscript.exe' -ArgumentList @(('"' + $vbsC + '"'), ('"' + $check + '"'), '-Quiet') -WindowStyle Hidden
+        } else {
+          Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $check + '"'), '-Quiet') -WindowStyle Hidden
+        }
+        Ok '自检已转到后台（约 1-2 分钟出结果，不耽误你；结果看 dsh-接入/logs/自检.log 或控制台页）'
+      } catch { Warn ('自检没能在后台启动（不影响主功能）：' + $_.Exception.Message) }
+    }
   } else { Warn '没找到自检脚本' }
+}
+
+# ---------------- ⑨.5 装完自检：微信/QQ 采集与插件是否就位 + 重启提醒 ----------------
+# 用户要求：装完要能一眼看出"微信/QQ 插件装了没"，并且**明确提醒重启 DSH**。
+# 为什么这件事必须由安装器做：插件是 DSH 启动时装载的，装完不重启 = 待办永远不更新，
+#   而界面不会有任何报错（历史事故：插件清单带 BOM → DSH 静默跳过整包）。
+Head '⑨.5 装完自检（微信 / QQ 采集与插件是否就位）'
+$chkRows = @()
+$needRestart = $false
+if ($DryRun) {
+  Say '  将检查：计划任务 / 采集脚本 / DSH 插件挂载 / 客户端是否运行'
+} else {
+  # ① 采集脚本在不在
+  foreach ($c in @(
+      @{ key = '微信采集脚本'; path = (Join-Path $InstallDir 'wx-采集器\采集器.ps1') },
+      @{ key = 'QQ 采集脚本'; path = (Join-Path $InstallDir 'wx-采集器\采集器-QQ.ps1') },
+      @{ key = '抽取插件目录'; path = (Join-Path $InstallDir 'dsh-msg-memo\package.json') }
+    )) {
+    $ok = Test-Path -LiteralPath $c.path
+    $chkRows += [pscustomobject]@{ key = $c.key; ok = $ok; detail = $(if ($ok) { '就位' } else { '缺失：' + $c.path }) }
+  }
+  # ② 计划任务在不在（采集没建任务 = 不会自动跑）
+  foreach ($c in @(
+      @{ key = '微信采集任务'; task = '微信待办-采集' },
+      @{ key = 'QQ 采集任务'; task = 'QQ待办-采集' }
+    )) {
+    $t = $null
+    try { $t = Get-ScheduledTask -TaskName $c.task -ErrorAction SilentlyContinue } catch { }
+    $ok = ($null -ne $t)
+    $chkRows += [pscustomobject]@{ key = $c.key; ok = $ok; detail = $(if ($ok) { '已创建（' + $t.State + '）' } else { '未创建 —— 该端不会自动采集' }) }
+  }
+  # ③ DSH 插件挂上了没（profile package.json + junction）
+  $profOk = $false; $profDetail = '未挂载'
+  try {
+    $pf = Join-Path $env:USERPROFILE ('.dsh\profiles\' + $ProfileName + '\package.json')
+    $ln = Join-Path $env:USERPROFILE ('.dsh\profiles\' + $ProfileName + '\node_modules\@local\dsh-msg-memo')
+    $hasDep = $false
+    if (Test-Path -LiteralPath $pf) {
+      $pj = ([System.IO.File]::ReadAllText($pf, [System.Text.Encoding]::UTF8)) -replace '^\uFEFF', ''
+      $hasDep = ($pj -match [regex]::Escape('@local/dsh-msg-memo'))
+    }
+    $hasLink = Test-Path -LiteralPath $ln
+    $profOk = ($hasDep -and $hasLink)
+    $profDetail = if ($profOk) { '已挂载（重启 DSH 后生效）' }
+                  elseif ($hasDep -and -not $hasLink) { '依赖写了但 junction 缺失 → 重跑安装' }
+                  elseif (-not $hasDep -and $hasLink) { 'junction 在但 package.json 没依赖 → 重跑安装' }
+                  else { '未挂载（插件不会装载）' }
+  } catch { $profDetail = '检查失败：' + $_.Exception.Message }
+  $chkRows += [pscustomobject]@{ key = 'DSH 抽取插件'; ok = $profOk; detail = $profDetail }
+  if ($profOk) { $needRestart = $true }
+
+  # ④ 客户端在不在跑（不在跑不报错，只是采不到）
+  foreach ($c in @(
+      @{ key = '微信客户端'; proc = 'Weixin' },
+      @{ key = 'QQ 客户端'; proc = 'QQ' }
+    )) {
+    $running = @(Get-Process -Name $c.proc -ErrorAction SilentlyContinue).Count -gt 0
+    $chkRows += [pscustomobject]@{ key = $c.key; ok = $running; detail = $(if ($running) { '运行中' } else { '未运行（该端本轮跳过，不报错）' }) }
+  }
+
+  # 打印成一张表（每行一眼看懂）
+  Say ''
+  foreach ($r in $chkRows) {
+    $mark = if ($r.ok) { '  [OK] ' } else { '  [--] ' }
+    $color = if ($r.ok) { 'Green' } else { 'Yellow' }
+    Write-Host ($mark + $r.key.PadRight(14) + ' ' + $r.detail) -ForegroundColor $color
+  }
+  Say ''
+}
+
+# ⑤ 明确的重启提醒 + 写"等待重启"标记，并静默拉起守护脚本（重启后自动打开控制台）
+if (-not $DryRun) {
+  if ($needRestart) {
+    Write-Host '  ============================================================' -ForegroundColor Yellow
+    Write-Host '   现在请重启 DSH（插件是启动时装载的，不重启待办永远不会更新）' -ForegroundColor Yellow
+    Write-Host '   重启后会自动打开控制台页面，不用你再去找' -ForegroundColor Yellow
+    Write-Host '  ============================================================' -ForegroundColor Yellow
+    $markDir = Join-Path $InstallDir 'dsh-接入\logs'
+    if (-not (Test-Path -LiteralPath $markDir)) { New-Item -ItemType Directory -Force -Path $markDir | Out-Null }
+    $marker = Join-Path $markDir '等待重启.txt'
+    try {
+      [System.IO.File]::WriteAllText($marker, ('安装完成于 ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')), (New-Object System.Text.UTF8Encoding($false)))
+      $watcher = Join-Path $InstallDir 'dsh-接入\重启后打开控制台.ps1'
+      $vbs = Join-Path $InstallDir 'dsh-接入\run-hidden.vbs'
+      if ((Test-Path -LiteralPath $watcher) -and (Test-Path -LiteralPath $vbs)) {
+        & wscript.exe $vbs $watcher -MarkerFile $marker -MaxWaitMin 30
+        Ok '已挂上"重启后自动打开控制台"（最多等 30 分钟；你也可以随时双击 打开控制台.cmd）'
+      } else {
+        Warn '没找到守护脚本，重启后请手动双击 群聊待办\打开控制台.cmd'
+      }
+    } catch { Warn ('重启后自动打开控制台没挂上（不影响其它功能）：' + $_.Exception.Message) }
+  } else {
+    Warn '插件没挂载成功 → 先别重启，按上面提示重跑一次安装（否则重启也不会有待办）'
+  }
 }
 
 # ---------------- ⑩ 待办管家规则填本机路径 + 打开控制台 ----------------

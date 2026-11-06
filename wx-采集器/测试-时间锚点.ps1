@@ -8,6 +8,9 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\测试-时间锚点.ps1
 # 退出码：0 = 全过；1 = 有失败项。
 param()
+# 离线 fixture 测试必须与本机真实档案无关（否则本机标定过会让 fixture 结果漂移）：
+$env:WX_LAYOUT_PROFILE = 'none'
+$env:WX_LAYOUT_PROFILE_QQ = 'none'
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 . (Join-Path $here 'wxlib.ps1')

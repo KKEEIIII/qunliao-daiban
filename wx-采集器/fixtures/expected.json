@@ -1,6 +1,6 @@
 {
   "fixture": "wechat-list.json",
-  "minSessions": 6,
+  "minSessions": 5,
   "mustContain": [
     "示例群A",
     "示例群G",

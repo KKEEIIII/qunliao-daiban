@@ -70,7 +70,7 @@
   "_notes_broadcast": "2026-10-26：白名单内所有群的 mention 规则都识别这些\"告知所有人\"的词；Test-BroadcastKeyword 另内置同一套 + OCR 容错，这里写出来是为了日志可读",
   "maaRawSize": true,
   "_notes_maaRawSize": "true=抓图用窗口原始分辨率(识别更准但实测 Maa 点击坐标会越界/点错行)；false=默认缩到968x720(点击可靠)",
-  "_notes_maaInputMethod": "2=SendMessage(后台不抢焦点) 4=PostMessage 1024=AnchoredTouch(需提前台)",
+  "_notes_maaInputMethod": "2=SendMessage（默认，实测唯一落点准的后台输入法：点哪行开哪行，且不抢焦点）。32/64/128/256 这些带 CursorPos/WindowPos 的变体实测全部点错：32/128 点到相邻群、64/256 点出空面板（抓图尺寸=客户区尺寸、客户区偏移 dx=dy=0，所以不是\"差一个偏移量\"，而是投递位置本身不可靠，无法校准）。1024=AnchoredTouch 需要前台。",
   "qqHistoryMaxScreens": 40,
   "qqHistoryUntilAnchor": true,
   "_notes_qqHistoryScreens": "第一次采某个群（还没有锚点）时翻几屏",
@@ -80,5 +80,6 @@
   "_notes_listToTopRounds": "每轮开始前用真实滚轮把会话列表滚回顶部，最多滚这么多次（0=关闭）。用来防「列表停在中间→上方的群永远读不到」",
   "chatYTo": 0.88,
   "_notes_chat": "聊天正文抓取区域（按抓图比例）。2026-10-27 实测：右侧面板从 x≈0.85 起（上面是群公告、下面是群聊成员），0.87 会把公告和成员名当成聊天内容；聊天栏实际到 x≈0.84。",
+  "_notes_scrollSecurity": "滚轮不抢焦点：Windows 把 WM_MOUSEWHEEL 发给\"光标下那个窗口\"，不会激活窗口。判据是\"滚动点是否归 QQ\"（WxGuardedInput.OnPoint）：被别的窗口盖住就跳过并记日志，绝不把滚轮发给别的应用。QQ 在后台但只要露出来就能滚，不需要前台。",
   "_设置说明": "groupWhitelist：要盯的 QQ 群名（QQ 采集依赖 MaaFramework 后台截图，坐标可能需要在你自己机器上重新标定，见 快速开始.md）"
 }

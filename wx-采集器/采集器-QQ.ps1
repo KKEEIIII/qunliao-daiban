@@ -25,7 +25,8 @@ param(
   [switch]$MaaMode,          # 强制 MaaFramework 后台模式
   [switch]$ScreenMode,       # 强制屏幕截取模式
   [string]$ConfigPath = '',  # 指定配置文件（默认 config-qq.json）。回归测试用来试不同抓图分辨率，不动线上配置
-  [switch]$NoAutoClick       # Maa 模式下也只读当前打开的群（不逐行点开）
+  [switch]$NoAutoClick,      # Maa 模式下也只读当前打开的群（不逐行点开）
+  [switch]$Calibrate         # 只标定布局：量出 QQ 窗口的列表宽度/列表上沿，写 layout-profile-qq.txt 后退出
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,6 +67,146 @@ function Log([string]$m) {
 }
 function Norm([string]$s) { if ($null -eq $s) { return '' } return (($s -replace '\s', '') -replace '[：:，。、．（）()]', '') }
 
+# 按 config.chatRules.match 将多个 OCR 白名单词归并成一个逻辑群；未归入规则组的词各自成组。
+function Get-QqLogicalGroups {
+  param([string[]]$Whitelist = @(), [object[]]$Rules = @())
+  $groups = @(); $used = @{}
+  foreach ($rule in @($Rules)) {
+    if (-not $rule -or -not $rule.match) { continue }
+    $aliases = @()
+    foreach ($alias in @($rule.match)) {
+      $normAlias = Norm ([string]$alias)
+      if (-not $normAlias) { continue }
+      $actual = @($Whitelist | Where-Object { (Norm ([string]$_)) -eq $normAlias } | Select-Object -First 1)
+      if ($actual.Count -gt 0 -and -not $used.ContainsKey($normAlias)) { $aliases += [string]$actual[0] }
+    }
+    if ($aliases.Count -lt 2) { continue }
+    $key = [string]$aliases[0]
+    $groups += [pscustomobject]@{ key = $key; aliases = [string[]]$aliases }
+    foreach ($alias in $aliases) { $used[(Norm $alias)] = $true }
+  }
+  foreach ($alias in @($Whitelist)) {
+    $normAlias = Norm ([string]$alias)
+    if (-not $normAlias -or $used.ContainsKey($normAlias)) { continue }
+    $groups += [pscustomobject]@{ key = [string]$alias; aliases = [string[]]@([string]$alias) }
+    $used[$normAlias] = $true
+  }
+  return $groups
+}
+function Get-QqLogicalKey {
+  param([string]$Alias, [object[]]$Groups = @())
+  $n = Norm $Alias
+  foreach ($group in @($Groups)) {
+    foreach ($member in @($group.aliases)) { if ((Norm ([string]$member)) -eq $n) { return [string]$group.key } }
+  }
+  return $Alias
+}
+function Test-QqLogicalGroupFound {
+  param([string]$Alias, [object[]]$Groups = @(), [hashtable]$Found = @{})
+  $key = Get-QqLogicalKey -Alias $Alias -Groups $Groups
+  return $Found.ContainsKey($key)
+}
+function Get-QqMissingLogicalGroups {
+  param([object[]]$Groups = @(), [hashtable]$Found = @{})
+  return ,@($Groups | Where-Object { -not $Found.ContainsKey([string]$_.key) })
+}
+function Get-QqMissingAliases {
+  param([object[]]$Groups = @(), [hashtable]$Found = @{})
+  $aliases = @()
+  foreach ($group in @(Get-QqMissingLogicalGroups -Groups $Groups -Found $Found)) {
+    foreach ($alias in @($group.aliases)) { if ($alias -and $aliases -notcontains [string]$alias) { $aliases += [string]$alias } }
+  }
+  return ,$aliases
+}
+function Format-QqLogicalGroup {
+  param($Group)
+  if (-not $Group) { return '' }
+  $aliases = @($Group.aliases)
+  if ($aliases.Count -le 1) { return [string]$Group.key }
+  return ('{0}（别名：{1}）' -f $Group.key, (($aliases | Select-Object -Skip 1) -join '/'))
+}
+
+# QQ 完整轮次历史：7 天留存、2MiB 上限；用 JavaScriptSerializer + UTF8 无 BOM 原子重写，
+# 不走 ConvertTo-Json/Set-Content。每条包含逻辑群清单、成功/漏读组和轮次状态。
+function Initialize-QqRoundCoverage {
+  $wl = @($cfg.groupWhitelist | Where-Object { $_ })
+  $rules = if ($cfg.PSObject.Properties.Name -contains 'chatRules') { @($cfg.chatRules) } else { @() }
+  $script:QqRoundGroups = @(Get-QqLogicalGroups -Whitelist $wl -Rules $rules)
+  $script:QqRoundFound = @{}
+}
+function Get-QqRoundCoverageDetail {
+  $groups = @($script:QqRoundGroups)
+  $found = if ($script:QqRoundFound) { $script:QqRoundFound } else { @{} }
+  $success = @($groups | Where-Object { $found.ContainsKey([string]$_.key) } | ForEach-Object { [string]$_.key })
+  $missed = @($groups | Where-Object { -not $found.ContainsKey([string]$_.key) } | ForEach-Object { [string]$_.key })
+  $pct = if ($groups.Count -gt 0) { [int][Math]::Round(100.0 * $success.Count / $groups.Count) } else { 0 }
+  return [pscustomobject]@{ groups = @($groups | ForEach-Object { [string]$_.key }); success = $success; missed = $missed; percent = $pct; note = ('QQ覆盖 {0}/{1}（{2}%）' -f $success.Count,$groups.Count,$pct) }
+}
+function Finish-QqRoundObservation {
+  param([ValidateSet('complete','env-skip','failure')][string]$Status)
+  if ($script:QqWheelObstructed) { $Status = 'env-skip' }
+  $detail = Get-QqRoundCoverageDetail
+  $missed = if ($Status -eq 'complete') { @($detail.missed) } else { @() }
+  [void](Write-QqRoundObservation -Status $Status -Groups @($detail.groups) -Success @($detail.success) -Missed $missed)
+  $script:QqCoverageNote = $detail.note
+  if ($Status -eq 'complete') {
+    Log ('  ' + $detail.note)
+    if ($detail.missed.Count -gt 0) { Log ('  本轮未覆盖逻辑群：' + ((Get-QqMissingLogicalGroups -Groups @($script:QqRoundGroups) -Found $script:QqRoundFound | ForEach-Object { Format-QqLogicalGroup $_ }) -join '、')) }
+  }
+  return $detail
+}
+function Write-QqRoundObservation {
+  param([string]$Status, [string[]]$Groups = @(), [string[]]$Success = @(), [string[]]$Missed = @(), [string]$Path = '')
+  try {
+    if (-not $Path) { $Path = Join-Path $stateDir 'qq-rounds.jsonl' }
+    $mutex = New-Object System.Threading.Mutex($false, 'Local\QqRoundHistory')
+    $locked = $false
+    try {
+      try { $locked = $mutex.WaitOne(5000) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
+      if (-not $locked) { throw 'QQ 轮次历史锁忙' }
+      Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
+      $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+      $now = Get-Date
+      $kept = @()
+      if (Test-Path -LiteralPath $Path) {
+        foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+          if ([string]::IsNullOrWhiteSpace($line)) { continue }
+          try {
+            $old = $serializer.DeserializeObject($line)
+            $at = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$old.at, [ref]$at) -and $at -ge $now.AddDays(-7)) { $kept += $line }
+          } catch { }
+        }
+      }
+      $row = [ordered]@{
+        schema = 1; at = $now.ToString('o'); status = $Status
+        groups = [string[]]@($Groups); success = [string[]]@($Success); missed = [string[]]@($Missed)
+      }
+      $kept += $serializer.Serialize($row)
+      $maxBytes = 2MB
+      while ($kept.Count -gt 1 -and [System.Text.Encoding]::UTF8.GetByteCount(($kept -join "`n") + "`n") -gt $maxBytes) {
+        $kept = @($kept | Select-Object -Skip 1)
+      }
+      $dir = Split-Path -Parent $Path
+      if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+      $tmp = $Path + '.tmp-' + [guid]::NewGuid().ToString('N')
+      [System.IO.File]::WriteAllText($tmp, (($kept -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+      if (Test-Path -LiteralPath $Path) {
+        $bak = $Path + '.bak'
+        try { [System.IO.File]::Replace($tmp, $Path, $bak) } catch { [System.IO.File]::Delete($Path); [System.IO.File]::Move($tmp, $Path) }
+        if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+      } else { [System.IO.File]::Move($tmp, $Path) }
+      return $true
+    } finally {
+      if ($locked) { $mutex.ReleaseMutex() }
+      $mutex.Dispose()
+    }
+  } catch {
+    try { Log ('  [覆盖统计] 轮次历史写入失败：' + $_.Exception.Message) } catch { }
+    return $false
+  }
+}
+
 # R1（2026-10-27 用户要求）：采集器必须知道**命令执行时间** ——
 #   聊天区里的时间分隔行是 "昨天19:22 / 今天9:05 / 星期五23:38" 这种**相对时间**，
 #   必须用"本轮执行时间"当基准才能解析成绝对时间（拿 Get-Date 当"现在"去算，
@@ -97,7 +238,14 @@ function Get-Levenshtein([string]$a, [string]$b) {
 # 2026-10-26：白名单匹配统一走 wxlib 的 Test-ChatNameMatch（包含 / 数字前缀 / 开头文字容错 / 滑窗距离）。
 # 白名单现在同时支持"短关键词"（示例群F/示例部门/某学校/示例群B/示例群I/<示例群号>）和完整群名。
 function Test-QqMatch([string]$name, [string]$pattern) {
-  return (Test-ChatNameMatch -Name (Norm $name) -Pattern (Norm $pattern))
+  $a = Norm $name; $b = Norm $pattern
+  if ($a.Length -lt 2 -or $b.Length -lt 2) { return $false }
+  if ($a -eq $b) { return $true }
+  # 完整群名确认保持严格：允许 QQ OCR 的 1–4 位数字前缀，但去掉后必须全文相等。
+  if ($b.Length -ge 5 -and $a -match '^[0-9]{1,4}.+$' -and ($a -replace '^[0-9]{1,4}', '') -ieq $b) { return $true }
+  # 短关键词仅作兼容性匹配；完整群名不走包含/编辑距离，避免跨群归属。
+  if ($b.Length -le 4 -and $a.StartsWith($b, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  return $false
 }
 # 粗筛（只用来挑"值得点开看看"的行；真正的白名单判定一律用点开后的聊天头部）
 # 短词也能粗筛：包含优先，其次开头 min(6, 长度) 个字编辑距离≤1（"示例部门" ← "示例部门"）。
@@ -300,6 +448,7 @@ function Write-Record($rec, [string]$tag) {
 # ============ MaaFramework 后台模式 ============
 function Invoke-QqMaaPass {
   $script:MaaFailed = $true
+  $script:QqWheelObstructed = $false
   if (-not (Test-Path -LiteralPath (Join-Path $maaDir 'qqread.ps1'))) {
     Log ("跳过：找不到 Maa 封装（" + $maaDir + "）"); return 0
   }
@@ -316,11 +465,13 @@ function Invoke-QqMaaPass {
   } catch {
     Log ('Maa 初始化异常（如缺 VC++ 运行库？），回退屏幕模式：' + $_.Exception.Message)
     Log '  ⚠️ 注意：屏幕模式（openChatOnly=true）只读"当前打开的会话"，不是全量轮读；想后台全量采集请先解决 Maa（最常见是装 VC++ 运行库）'
+    $script:MaaInitUnavailable = $true
     return 0
   }
   if (-not $ctx.ok) {
     Log ('Maa 不可用：' + $ctx.reason)
     Log '  ⚠️ 注意：屏幕模式（openChatOnly=true）只读"当前打开的会话"，不是全量轮读；想后台全量采集请先解决 Maa'
+    $script:MaaInitUnavailable = $true
     return 0
   }
   $script:MaaFailed = $false
@@ -361,6 +512,10 @@ function Invoke-QqMaaPass {
     #    （实测：滚到中间后行名会归错行 → 白名单匹配从 4~5 个掉到 2 个，后面全乱）。
     #    这里用真实滚轮向上滚足量（滚轮对 QQ 有效，Maa 的 PostScroll 无效）。
     $wl = @($cfg.groupWhitelist | Where-Object { $_ })
+    $coverageGroups = @(Get-QqLogicalGroups -Whitelist $wl -Rules @($chatRules))
+    $coverageKeys = @($coverageGroups | ForEach-Object { [string]$_.key })
+    $script:QqCoverageNote = ''
+    Initialize-QqRoundCoverage
 
     # 预检（2026-10-26）：**滚到顶部之前**先抓一张图，看有没有「返回/群助手」标记。
     # 为什么必须提前：实测滚轮会把「群助手」浮层滚掉 —— 滚完再检测就永远读不到那一行，
@@ -414,11 +569,105 @@ function Invoke-QqMaaPass {
       elseif ($preAsstRow) { Log ("  预检：滚轮前见「群助手」标记（{0}）→ 本轮先退回群聊列表" -f $preSrc) }
     } catch { Log ('  预检失败（不影响主流程）：' + $_.Exception.Message) }
 
+    # 真实滚轮是**全局鼠标输入**：它被发给"光标下那个窗口"，本身不抢焦点；
+    #   真正的风险是落点被别的窗口盖住 → 滚到别人身上（用户最初报的就是这个）。
+    # 2026-11-04：判据从"QQ 是否在前台"改成"滚动点是否归 QQ"（wxlib 的 WxGuardedInput.OnPoint），
+    #   于是 QQ 在后台、只要没被遮挡就能滚 —— 既不抢焦点，也不会误滚别的应用。
+    #   注意 Maa 的后台滚动对 QQ 无效（2/4/32/64/128/256 实测均"返回 True 但画面不动"），只能走真实滚轮。
+    function Test-QqWheelAllowed {
+      param([string]$Area = 'list')
+      try {
+        # Get-Qq*ScreenPoint now tests multiple candidate points with TopAt and only returns
+        # a point that is still owned by QQ; Invoke-TargetWindowWheel checks again before input.
+        if ($Area -eq 'chat') { [void](Get-QqChatScreenPoint -Ctx $ctx) }
+        else { [void](Get-QqListScreenPoint -Ctx $ctx) }
+        $script:QqWheelObstructed = $false
+        return $true
+      } catch {
+        if ($_.Exception.Message -match '候选点均被遮挡') { $script:QqWheelObstructed = $true }
+        return $false
+      }
+    }
+
     $toTop = if ($cfg.PSObject.Properties['normalizeListToTop']) { [bool]$cfg.normalizeListToTop } else { $true }
+    $topNotches = [int]$(if ($cfg.topNotches) { $cfg.topNotches } else { 18 })
+
+    # 2026-11-06：滚动点被别的前台窗口盖住时的兜底 —— **临时把 QQ 提到 z 序最前 → 滚到顶 → 复原 z 序**。
+    #   为什么需要：截图/点击都是后台的（Maa PrintWindow + SendMessage），唯独滚轮只能是真实输入，
+    #   而 Windows 把 WM_MOUSEWHEEL 发给"光标下那个窗口" → 被盖住就只能滚到别人身上。
+    #   怎么判断"到顶"：**内容签名不再变化**（滚一屏后 OCR 文本一模一样 = 到顶）。
+    #     QQ 没有微信那种"顶行被切"的稳定特征（实测：滚动后首行 y=124、在顶部 y=141，
+    #     行高 10 vs 13，区分度不够），所以用签名法，不猜几何。
+    #   全程 SWP_NOACTIVATE，不抢焦点；QQ 在最前停留约 0.2~0.5 秒后回到原 z 位置。
+    function Get-QqListSignature($Ctx, [string]$Tag) {
+      $s = Get-QqShot -Ctx $Ctx -Path (Join-Path $shotDir ("qq-sig-{0}.png" -f $Tag))
+      return (@($s.rows | Where-Object { $_.x -lt ([double]$Ctx.captureW * 0.42) } | Sort-Object y |
+          ForEach-Object { [string]$_.text }) -join '|')
+    }
+
+    function Invoke-QqTopmostToTop {
+      param($Ctx, [int]$MaxRounds = 8, [int]$StepNotches = 6)
+      $h = $Ctx.win.hwnd
+      $wasTop = [WxNative]::IsTopmost($h)
+      # 复原锚点：沿 z 序往上找到「第一个不属于 QQ 的窗口」。
+      #   不能直接用 ZPrev —— 实测它返回的是 QQ 自己的附属窗口（0x2058C），
+      #   把 QQ 放到它下面 QQ 仍然压着别人（复原失败、QQ 一直留在最前）。
+      $pidOwn = [uint32]0
+      [void][WxNative]::GetWindowThreadProcessId($h, [ref]$pidOwn)
+      $anchor = [IntPtr]::Zero; $cur = [WxNative]::ZPrev($h); $guard = 0
+      while ($cur -ne [IntPtr]::Zero -and $guard -lt 40) {
+        $p2 = [uint32]0; [void][WxNative]::GetWindowThreadProcessId($cur, [ref]$p2)
+        $guard++
+        if ($p2 -ne $pidOwn) { $anchor = $cur; break }
+        $cur = [WxNative]::ZPrev($cur)
+      }
+      $SWP = 0x1 -bor 0x2 -bor 0x10          # NOSIZE | NOMOVE | NOACTIVATE
+      try {
+        [void][WxNative]::SetWindowPos($h, [IntPtr]::new(-1), 0, 0, 0, 0, $SWP)   # HWND_TOPMOST
+        Start-Sleep -Milliseconds 180
+        # 置顶后重新找一个"归 QQ"的滚动点；仍不行说明还有别的置顶窗口压着 → 放弃
+        try { [void](Get-QqListScreenPoint -Ctx $Ctx) } catch { return [pscustomobject]@{ ok = $false; rounds = 0; moved = $false } }
+        $prevSig = ''; $rounds = 0
+        for ($i = 0; $i -lt $MaxRounds; $i++) {
+          $sig = Get-QqListSignature -Ctx $Ctx -Tag ("tt{0}" -f $i)
+          if ($i -gt 0 -and $sig -eq $prevSig) { break }      # 再滚也不变 → 已到顶
+          $prevSig = $sig
+          [void](Invoke-QqWheel -Ctx $Ctx -Notches (-1 * $StepNotches) -SettleMs 550)
+          $rounds++
+        }
+        return [pscustomobject]@{ ok = $true; rounds = $rounds; moved = ($rounds -gt 0) }
+      } finally {
+        if (-not $wasTop) {
+          [void][WxNative]::SetWindowPos($h, [IntPtr]::new(-2), 0, 0, 0, 0, $SWP)  # HWND_NOTOPMOST
+          if ($anchor -ne [IntPtr]::Zero) {
+            # 放回"原来压在它上面的那个（非 QQ）窗口"下面 → 恢复原 z 序
+            [void][WxNative]::SetWindowPos($h, $anchor, 0, 0, 0, 0, $SWP)
+          }
+        }
+      }
+    }
+
     if ($toTop -and -not ($NoAutoClick -or $ReadOpen) -and -not $preBackRow -and -not $preAsstRow) {
-      $topNotches = [int]$(if ($cfg.topNotches) { $cfg.topNotches } else { 18 })
-      [void](Invoke-QqWheel -Ctx $ctx -Notches (-$topNotches) -SettleMs 500)
-      Log ("  已把会话列表滚到顶部（向上 {0} 格）" -f $topNotches)
+      if (Test-QqWheelAllowed) {
+        [void](Invoke-QqWheel -Ctx $ctx -Notches (-$topNotches) -SettleMs 500)
+        Log ("  已把会话列表滚到顶部（向上 {0} 格，未抢焦点）" -f $topNotches)
+      } else {
+        $topmostOn = -not ($cfg.PSObject.Properties['topmostScroll'] -and $cfg.topmostScroll -eq $false)
+        if ($topmostOn) {
+          try {
+            Log '  滚动点被遮挡 → 临时置顶后再滚（不抢焦点，滚完复原 z 序）'
+            $tt = Invoke-QqTopmostToTop -Ctx $ctx
+            if ($tt.ok) {
+              # 置顶兜底成功 = 这一轮**确实滚到了**，不能再标成"环境跳过"（否则覆盖 7/7 也是黄灯）
+              $script:QqWheelObstructed = $false
+              Log ("  已滚到顶部（临时置顶，{0} 轮，z 序已复原）" -f $tt.rounds)
+            }
+            else { Log '  临时置顶后滚动点仍不归 QQ（可能有别的置顶窗口）→ 放弃滚动' }
+          } catch { Log ('  临时置顶滚动失败：' + $_.Exception.Message) }
+        } else {
+          Log '  列表滚动点被别的窗口遮住 → 跳过"滚到列表顶部"，只读当前可见屏'
+        }
+      }
     }
 
     $listShot = Get-QqShot -Ctx $ctx -Path (Join-Path $shotDir 'qq-maa-list.png')
@@ -450,7 +699,7 @@ function Invoke-QqMaaPass {
     Log ("  行距自适应 = {0}px（点击偏移用 {1}，白名单命中 {2} 个{3}）" -f $auto.pitch, $auto.offset, $auto.score, $(if ($auto.rejected) { "，自动量的值偏离配置基准 $($auto.basePitch)px 太多已否决" } else { '' }))
     $wlVisible = @($wl | Where-Object { $g = $_; @($rowsAll | Where-Object { Test-QqPrefix -name $_.name -pattern $g }).Count -gt 0 })
     $curIsWl = $false
-    foreach ($g in $wl) { if (Test-QqMatch -name $view0.header -pattern $g) { $curIsWl = $true } }
+    foreach ($g in $wl) { if (Test-QqHeaderExact -Name $view0.header -Pattern $g) { $curIsWl = $true } }
     Log ("当前打开='" + $view0.header + "'｜列表行 " + $rowsAll.Count + "｜列表里可见白名单群 " + $wlVisible.Count + " 个（" + ($wlVisible -join '、') + "）")
     # 界面漂了（例如误点进"群助手"子列表）→ 尝试返回，**并且验证是否真的回去了**
     #
@@ -553,7 +802,7 @@ function Invoke-QqMaaPass {
         $nameOffset = $auto2.offset
         $wlVisible = @($wl | Where-Object { $g = $_; @($rowsAll | Where-Object { Test-QqPrefix -name $_.name -pattern $g }).Count -gt 0 })
         $curIsWl = $false
-        foreach ($g in $wl) { if (Test-QqMatch -name $view0.header -pattern $g) { $curIsWl = $true } }
+        foreach ($g in $wl) { if (Test-QqHeaderExact -Name $view0.header -Pattern $g) { $curIsWl = $true } }
         # 验证改用**屏幕截图**看上部还有没有「返回」——比"列表行数>2"可靠
         # （群助手子列表也可能有 8 行，旧判据会误报"返回成功"，实测踩到）。
         $stillBack = $false
@@ -574,6 +823,7 @@ function Invoke-QqMaaPass {
     }
     if (-not $curIsWl -and $wlVisible.Count -eq 0) {
       Log '⚠️ 既没打开白名单群、列表里也看不到白名单群 → QQ 可能不在「群聊」列表（需手动切回）；本轮跳过'
+      $script:skipNote = 'QQ 不在群聊列表，本轮环境跳过'
       return 0
     }
 
@@ -586,8 +836,9 @@ function Invoke-QqMaaPass {
     # 当前已打开的白名单群：直接读，不用点
     if ($curIsWl) {
       $hit0 = ''
-      foreach ($g in $wl) { if (Test-QqMatch -name $view0.header -pattern $g) { $hit0 = $g } }
+      foreach ($g in $wl) { if (Test-QqHeaderExact -Name $view0.header -Pattern $g) { $hit0 = $g } }
       $h0 = [BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($view0.text))) -replace '-', ''
+      $rule0 = Get-ChatRule -Name $hit0 -Rules $chatRules -DefaultMode 'all' -DefaultKeywords @()
       if ($state.ContainsKey(('maa|' + $hit0)) -and $state[('maa|' + $hit0)] -eq $h0) {
         Log ("（已打开：" + $hit0 + " 内容没变化）")
       } elseif ($view0.chars -ge 4) {
@@ -606,7 +857,6 @@ function Invoke-QqMaaPass {
           text = ($name0 + "`n" + $view0.text)
           lines = @($view0.lines | ForEach-Object { [ordered]@{ x = $_.x; y = $_.y; t = $_.text } })
         }
-        $rule0 = Get-ChatRule -Name $hit0 -Rules $chatRules -DefaultMode 'all' -DefaultKeywords @()
         # 2026-10-26：与正文过滤统一走 Test-BroadcastKeyword（内置"告知所有人"全套词 + OCR 容错）
         if ($rule0.mode -ne 'all' -and -not (Test-BroadcastKeyword -Text $view0.text -ExtraKeywords $rule0.keywords)) {
           Log ("当前打开的 " + $hit0 + " 按规则只采[{0}]，本条没命中 → 不收" -f ($rule0.keywords -join '/'))
@@ -615,7 +865,11 @@ function Invoke-QqMaaPass {
           Log ("当前打开的白名单群：" + $hit0 + " → 收下 " + $view0.chars + " 字")
         }
       }
-      if ($hit0) { $foundGroups[$hit0] = $true }
+      if ($hit0 -and $view0.chars -ge 4) {
+        $logicalKey = Get-QqLogicalKey -Alias $hit0 -Groups $coverageGroups
+        $foundGroups[$logicalKey] = $true
+        $script:QqRoundFound[$logicalKey] = $true
+      }
     }
 
     # ---------- 逐行点开候选（行名粗筛只是省时间；真正的白名单判定用点开后的聊天头部） ----------
@@ -668,11 +922,11 @@ function Invoke-QqMaaPass {
         param($Row, $SettleMs)
         $clickMode = if ($cfg.PSObject.Properties['maaClickMode']) { [string]$cfg.maaClickMode } else { 'maa' }
         if ($clickMode -eq 'real') {
-          $wx0 = [int]$ctx.win.x; $wy0 = [int]$ctx.win.y
+          $fresh = Update-QqWindowRect -Ctx $ctx
           $cx = if ($Row.clickX) { [int]$Row.clickX } else { $rowClickX }
-          $px = $wx0 + $cx
-          $py = $wy0 + [int]$Row.y
-          if (-not [WxNative]::TopAt($px, $py)) {
+          $px = [int]($fresh.x + $cx * $fresh.w / [double]$ctx.captureW)
+          $py = [int]($fresh.y + $Row.y * $fresh.h / [double]$ctx.captureH)
+          if ([WxNative]::TopAt($px, $py) -ne $ctx.win.hwnd -or [WxNative]::GetForegroundWindow() -ne $ctx.win.hwnd) {
             Log ("  [跳过·点不到QQ] 屏幕({0},{1}) 最顶层不是 QQ" -f $px, $py)
             return $false
           }
@@ -680,8 +934,7 @@ function Invoke-QqMaaPass {
           Start-Sleep -Milliseconds ([int]$SettleMs)
           return $true
         }
-        [void](Invoke-QqClickRow -Ctx $ctx -Row ([pscustomobject]@{ index = $Row.index; y = $Row.y; clickX = $rowClickX }) -SettleMs $SettleMs)
-        return $true
+        return (Invoke-QqClickRow -Ctx $ctx -Row ([pscustomobject]@{ index = $Row.index; y = $Row.y; clickX = $rowClickX }) -SettleMs $SettleMs)
       }
 
       # ⚠️ 只点一次！QQ 里"再点一下同一个会话"会把聊天区取消选中变空（用户实测反馈 + 日志印证）。
@@ -690,7 +943,9 @@ function Invoke-QqMaaPass {
       #      外层数组不会被更新（实测：日志说"收下"，spool 却一行没写）。收记录/写状态一律在调用方做。
       function Read-QqTarget {
         param($Target, $Settle)
-        [void](Invoke-QqRowClick -Row ([pscustomobject]@{ index = $Target.index; y = $Target.y; clickX = $rowClickX }) -SettleMs $Settle)
+        if (-not (Invoke-QqRowClick -Row ([pscustomobject]@{ index = $Target.index; y = $Target.y; clickX = $rowClickX }) -SettleMs $Settle)) {
+          throw 'INPUT_TARGET_LOST: QQ 点击未完成，停止本轮'
+        }
         $p2 = Join-Path $shotDir 'qq-maa-read.png'
         # 2026-10-27 改：**轮询**等渲染（最多 4 次 ×700ms），不再"只重读一次"。
         #   真机踩到：点开「示例学校新闻」后连续两次读到空画面（标题认不出 + 正文 0 字）→ 整轮跳过这个群；
@@ -734,14 +989,23 @@ function Invoke-QqMaaPass {
         #   这里的粗判比 $h3 那套**更宽松**（头部 or 列表行名任一命中即可）—— 宁可多收，不可漏；
         #   完整的白名单判定仍然在下面，一点不动。
         $preHit = ''
-        foreach ($g in $wl) { if (Test-QqMatch -name $v3.header -pattern $g) { $preHit = $g } }
-        if (-not $preHit -and $Target.guess) {
-          $nm5 = Norm ([string]$Target.name)
-          $best5 = ''
-          foreach ($g in @($Target.guess -split '/')) {
-            if ($g -and $nm5.Contains((Norm $g)) -and (Norm $g).Length -gt (Norm $best5).Length) { $best5 = $g }
+        foreach ($g in $wl) { if (Test-QqHeaderExact -Name $v3.header -Pattern $g) { $preHit = $g } }
+        # 列表名字只用于候选，不得替代当前聊天标题的确认。
+        # 2026-11-06：这里原来按**字面**比对猜名，实测把同一个群判成不符：
+        #   标题命中白名单 `<示例群号>`，而点击行记下的别名是 `示例群A前缀` → 字面不同 → 整条丢弃。
+        #   改成按**逻辑群 key** 比较（config 的 chatRules.match 把别名归到同一个群）。
+        $guessOk = $true
+        if ($Target.guess) {
+          $preKey = Get-QqLogicalKey -Alias ([string]$preHit) -Groups $coverageGroups
+          $guessOk = $false
+          foreach ($g2 in @($Target.guess -split '/')) {
+            if ([string]::IsNullOrWhiteSpace($g2)) { continue }
+            if ((Get-QqLogicalKey -Alias ([string]$g2) -Groups $coverageGroups) -eq $preKey) { $guessOk = $true; break }
           }
-          if ($best5) { $preHit = $best5 }
+        }
+        if (-not $preHit -or -not $guessOk) {
+          Log ('  标题与目标不符或未识别：{0} → {1}，丢弃本次读取' -f $Target.name, $v3.header)
+          return $null
         }
         $histInitial = if ($cfg.PSObject.Properties['qqHistoryScreens']) { [int]$cfg.qqHistoryScreens } else { 2 }
         $histHardMax = if ($cfg.PSObject.Properties['qqHistoryMaxScreens']) { [int]$cfg.qqHistoryMaxScreens } else { 40 }
@@ -755,7 +1019,7 @@ function Invoke-QqMaaPass {
         $histNotches = if ($cfg.PSObject.Properties['qqHistoryNotches']) { [int]$cfg.qqHistoryNotches } else { 3 }
         $histSettle = if ($cfg.PSObject.Properties['qqHistorySettleMs']) { [int]$cfg.qqHistorySettleMs } else { 600 }
         $histMax = if ($cfg.PSObject.Properties['qqHistoryMaxLines']) { [int]$cfg.qqHistoryMaxLines } else { 150 }
-        if ($histN -gt 0 -and $histNotches -gt 0 -and $v3.chars -ge 4) {
+        if ($histN -gt 0 -and $histNotches -gt 0 -and $v3.chars -ge 4 -and (Test-QqWheelAllowed -Area 'chat')) {
           Log ("  往期滚动：目标=翻到上次记录的边界（上限 {0} 屏）" -f $histN)
           $screens = @(, @($v3.lines))
           $scrolled = 0
@@ -765,6 +1029,9 @@ function Invoke-QqMaaPass {
               $ph = Join-Path $shotDir ('qq-hist-{0}.png' -f $hi)
               $sh = Get-QqShot -Ctx $ctx -Path $ph
               $vh = Get-QqChatView -Ctx $ctx -Rows $sh.rows
+              if (-not $sh.ok -or (Norm $vh.header) -ne (Norm $v3.header)) {
+                throw 'INPUT_TARGET_LOST: QQ 历史页标题改变或截图失败，丢弃本次读取'
+              }
               $scrolled++
               if ($vh.chars -lt 4) { Log ('  往期滚动：第 {0} 屏读不到内容（可能到顶）→ 停止' -f $hi); break }
               # 到顶判断跟**上一屏**比（$screens 最后一项），不是最新那一屏：
@@ -790,11 +1057,11 @@ function Invoke-QqMaaPass {
               $screens += , @($vh.lines)
             } catch {
               Log ('  往期滚动第 {0} 屏失败：{1}' -f $hi, $_.Exception.Message)
-              break
+              throw   # 安全失败终止本轮，不恢复滚动、不写锚点、不继续点群
             }
           }
-          if ($scrolled -gt 0) {
-            try { [void](Invoke-QqChatWheel -Ctx $ctx -Notches ($histNotches * $scrolled + 2) -SettleMs 400) } catch { }
+          if ($scrolled -gt 0 -and (Test-QqWheelAllowed -Area 'chat')) {
+            [void](Invoke-QqChatWheel -Ctx $ctx -Notches ($histNotches * $scrolled + 2) -SettleMs 400)
             $mergedLines = Merge-ChatScreens -Screens $screens -Header $v3.header -MaxLines $histMax -Log { param($m) Log $m }
             $mergedText = ($mergedLines -join "`n")
             $v3 = [pscustomobject]@{ text = $mergedText; header = $v3.header; chars = $mergedText.Length; lines = $mergedLines }
@@ -802,25 +1069,9 @@ function Invoke-QqMaaPass {
           }
         }
         $h3 = ''
-        foreach ($g in $wl) { if (Test-QqMatch -name $v3.header -pattern $g) { $h3 = $g } }
-        if (-not $h3 -and $Target.guess) {
-          # 兜底（2026-10-26）：头部 OCR 有时整行乱码 —— 实测点开 示例群B，头部被读成
-          #   "佣迮1」旧儼，找1刂，卜芸十冫莎泞」多，" → 判"不在白名单" → 整轮漏掉 示例群B。
-          # 但**列表里那一行的群名是清楚的**。所以：行名严格包含白名单词（不做容错）时，
-          # 就按该群收下（内容仍是点开后读到的正文，不伪造）。
-          $nm3 = Norm ([string]$Target.name)
-          # 取**最长**的那个匹配（"26示例部门小组"同时命中"示例部门"和"示例部门小组"，
-          # 必须取更具体的"示例部门小组"，否则会和"示例部门-示例群C"撞成同一个群）。
-          $bestG = ''
-          foreach ($g in @($Target.guess -split '/')) {
-            if ($g -and $nm3.Contains((Norm $g)) -and (Norm $g).Length -gt (Norm $bestG).Length) { $bestG = $g }
-          }
-          if ($bestG) {
-            $h3 = $bestG
-            Log ("  目标 y={0} → 头部认不出，但列表行名'{1}'严格命中「{2}」→ 按该群收下" -f $Target.y, $Target.name, $bestG)
-          }
-        }
-        if (-not $h3) { Log ("  目标 y={0} → 头部'{1}' 不在白名单，跳过" -f $Target.y, $v3.header) }
+        foreach ($g in $wl) { if (Test-QqHeaderExact -Name $v3.header -Pattern $g) { $h3 = $g } }
+        # 列表行只能候选，不能替代聊天头部确认；头部读不清就放弃，避免错误群归属。
+        if (-not $h3) { Log ("  目标 y={0} → 头部'{1}' 未严格确认，跳过" -f $Target.y, $v3.header) }
         elseif ($v3.chars -lt 4) { Log ("  目标 y={0} → {1} 正文太短（{2} 字），跳过" -f $Target.y, $h3, $v3.chars); $h3 = '' }
         return [pscustomobject]@{ hit = $h3; text = $v3.text; header = $v3.header; chars = $v3.chars; lines = $v3.lines; rowName = ([string]$Target.name) }
       }
@@ -830,8 +1081,7 @@ function Invoke-QqMaaPass {
       # 外层数组不会变（实测：日志说"收下"，spool 一行没写）。
       function Add-QqResult {
         param($Result)
-        if (-not $Result.hit) { return $null }
-        $foundGroups[$Result.hit] = $true
+        if (-not $Result.hit -or $Result.chars -lt 4) { return $null }
         $ruleR = Get-ChatRule -Name $Result.hit -Rules $chatRules -DefaultMode 'all' -DefaultKeywords @()
         # 2026-10-26：改用 Test-BroadcastKeyword —— 内置"告知所有人"全套词 + OCR 容错，
         # 配置里的 keywords 作为附加词（短词/完整名写哪种白名单都适用）。
@@ -839,6 +1089,9 @@ function Invoke-QqMaaPass {
           Log ("  {0} 按规则只采[{1}]，本条没命中 → 不收" -f $Result.hit, (@(Get-BroadcastKeywords) + @($ruleR.keywords) -join '/'))
           return $null
         }
+        $logicalKey = Get-QqLogicalKey -Alias $Result.hit -Groups $coverageGroups
+        $foundGroups[$logicalKey] = $true
+        $script:QqRoundFound[$logicalKey] = $true
         $hh = [BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Result.text))) -replace '-', ''
         # 去重要同时看"本轮已经收过的"（$newState）和"上一轮落盘的"（$state）——
         # 只看 $state 的话，同一个群在同一轮里被读两次（比如"当前已打开"+"点开候选"）会写两条重复记录。
@@ -902,14 +1155,23 @@ function Invoke-QqMaaPass {
           # 兜底时抓到的也是子列表的会话）。
           if ((Norm $r.name) -like '*群助手*') { continue }
           $pre = @($wl | Where-Object { Test-QqPrefix -name $r.name -pattern $_ })
-          # scanAllRows：OCR 经常读不出某些群的**名字行**（只读到预览行）→ 只挑"名字像白名单"的行会漏群。
-          # 打开后就把可见的行都点一遍，真正的判定交给点开后的**聊天头部**（更可靠，代价是会把点到的会话标记已读）。
+          # scanAllRows 仍兜底 OCR 漏名，但不再点击每条普通非白名单行：
+          #   · 缺失/极短文字、仅读到一条 OCR 行、明显像预览/时间戳的行保留为“歧义候选”；
+          #   · 有正常长度、无预览特征且不匹配白名单的名字视为明确无关，跳过；
+          # 点开后的聊天头部仍是唯一白名单确认，歧义候选不会直接写入记录。
           $scanAll = if ($cfg.PSObject.Properties['scanAllRows']) { [bool]$cfg.scanAllRows } else { $false }
           if ($pre.Count -eq 0) {
             if (-not $scanAll) { continue }
-            # ⚠️ 2026-10-15 修：这里原来写的是 `$Ctx`（大写 C），而本函数作用域里只有 `$ctx`（小写）。
-            #    PowerShell 变量不区分大小写，但 `$Ctx` 在该函数里**从未被赋值** → 表达式恒为 $null →
-            #    `$null -gt 数字` 为 false → 这道"太靠下的行别点"的闸门**恒等于 no-op**（另一台机器审阅时发现）。
+            # ⚠️ 不能把 preview-only 当作明确无关：会话名 OCR 漏失时常只剩预览，留作受限兜底。
+            $rawName = [string]$r.name
+            $normName = Norm $rawName
+            $textsN = if ($r.PSObject.Properties['texts']) { @($r.texts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) } else { @() }
+            $hasPreviewMark = $rawName -match '[：:，,。！？!?…~]' -or
+                              $rawName -match '^(今天|昨天|星期[一二三四五六日天]|周[一二三四五六日天]|\d{1,2}[:：]\d{1,2})'
+            $ambiguous = ($normName.Length -lt 2) -or ($normName.Length -le 2) -or
+                         ($textsN.Count -le 1) -or ($normName.Length -gt 18) -or $hasPreviewMark
+            if (-not $ambiguous) { continue }
+            # ⚠️ 2026-10-15 修：避免使用未赋值作用域变量作为边界；末行只在截图边缘跳过。
             if ($ctx -and $r.y -gt ($ctx.captureH * 0.95)) { continue }
           }
           # 优先用"该行文字定位"的 clickY（与行距/缩放无关）；没有才退回网格推算
@@ -959,7 +1221,7 @@ function Invoke-QqMaaPass {
       #   注意两点（都是实测踩过的）：
       #     ① 必须用**真实滚轮** Invoke-QqWheel —— Maa 的 Scroll 对 QQ 列表纹丝不动（全部返回 True 但界面没动）；
       #     ② 判据用"再滚一屏后 OCR 内容没变化"＝到顶了，不靠固定次数。
-      if (-not $ReadOpen) {
+      if (-not $ReadOpen -and (Test-QqWheelAllowed)) {
         $toTopMax = if ($cfg.PSObject.Properties['listToTopRounds']) { [int]$cfg.listToTopRounds } else { 8 }
         $prevSig = ''
         $moved = 0
@@ -972,6 +1234,22 @@ function Invoke-QqMaaPass {
           $moved++
         }
         Log ("  会话列表已滚到顶部（真实滚轮 {0} 次）" -f $moved)
+      } elseif (-not $ReadOpen) {
+        # 2026-11-06：遮挡兜底（与上面"滚到顶部"处同一套）：临时置顶 → 按内容签名滚到顶 → 复原 z 序
+        $topmostOn = -not ($cfg.PSObject.Properties['topmostScroll'] -and $cfg.topmostScroll -eq $false)
+        $doneTop = $false
+        if ($topmostOn) {
+          try {
+            $tt2 = Invoke-QqTopmostToTop -Ctx $ctx
+            $doneTop = [bool]$tt2.ok
+            if ($doneTop) {
+              $script:QqWheelObstructed = $false    # 同上：兜底成功就不算环境跳过
+              Log ("  已滚到顶部（临时置顶，{0} 轮，z 序已复原）" -f $tt2.rounds)
+            }
+            else { Log '  临时置顶后滚动点仍不归 QQ（可能有别的置顶窗口）→ 放弃滚动' }
+          } catch { Log ('  临时置顶滚动失败：' + $_.Exception.Message) }
+        }
+        if (-not $doneTop) { Log '  列表滚动点被遮住 → 跳过"滚到顶部"，只读当前这屏' }
       }
 
       # ① 先处理当前这一屏
@@ -980,7 +1258,7 @@ function Invoke-QqMaaPass {
       # ② 再滚回列表顶部读一屏（可选；实测回滚不稳定，默认关）
       $topPass = if ($cfg.PSObject.Properties['topPassScroll']) { [int]$cfg.topPassScroll } else { 0 }
       if ($topPass -gt 0) {
-        $missingTop = @($wl | Where-Object { $g = $_; -not ($foundGroups.ContainsKey($g)) })
+        $missingTop = @(Get-QqMissingAliases -Groups $coverageGroups -Found $foundGroups)
         if ($missingTop.Count -gt 0) {
           Log ("  回到顶部再读一屏（还缺：{0}）" -f ($missingTop -join '、'))
           [void](Invoke-QqScrollList -Ctx $ctx -Direction 'up' -Times $topPass -SettleMs 500)
@@ -994,8 +1272,11 @@ function Invoke-QqMaaPass {
       # **全部返回 True 但 QQ 列表纹丝不动**；真实滚轮事件（mouse_event WHEEL）才有效。
       # 滚轮需要光标在列表上，Invoke-QqWheel 会临时移过去、滚完还原。
       $scrollSearchSteps = if ($cfg.PSObject.Properties['scrollSearchSteps']) { [int]$cfg.scrollSearchSteps } else { 8 }
-      if (-not ($NoAutoClick -or $ReadOpen) -and $scrollSearchSteps -gt 0) {
-        $missingNow = @($wl | Where-Object { $g = $_; -not ($foundGroups.ContainsKey($g)) })
+      if (-not ($NoAutoClick -or $ReadOpen) -and $scrollSearchSteps -gt 0 -and -not (Test-QqWheelAllowed)) {
+        Log '  列表滚动点被遮住 → 跳过"滚动找群"，只读当前可见屏'
+      }
+      if (-not ($NoAutoClick -or $ReadOpen) -and $scrollSearchSteps -gt 0 -and (Test-QqWheelAllowed)) {
+        $missingNow = @(Get-QqMissingAliases -Groups $coverageGroups -Found $foundGroups)
         if ($missingNow.Count -gt 0) {
           Log ("  滚动找群：还缺 {0}（最多滚 {1} 步，每步 2 格）" -f ($missingNow -join '、'), $scrollSearchSteps)
           $rolled = 0
@@ -1042,17 +1323,18 @@ function Invoke-QqMaaPass {
                 $rejectedNames += (Norm $t.name)   # 记住这行不是白名单群，本轮别再点同类行
               }
             }
-            $missingNow = @($wl | Where-Object { $g = $_; -not ($foundGroups.ContainsKey($g)) })
+            $missingNow = @(Get-QqMissingAliases -Groups $coverageGroups -Found $foundGroups)
             if ($missingNow.Count -eq 0) { Log ("    滚动 {0} 步后白名单群全部找到" -f $step); break }
             # 一步都没看到候选就继续滚；连续 3 步无候选说明到底了
             if ($t5.Count -eq 0 -and $step -ge 3) { Log '    连续滚动都没看到候选（可能已到底）'; }
           }
-          if ($rolled -gt 0) {
+          if ($rolled -gt 0 -and (Test-QqWheelAllowed)) {
             [void](Invoke-QqWheel -Ctx $ctx -Notches (-$rolled))
             Log ("    已把列表滚回原位（向上 {0} 格）" -f $rolled)
           }
         }
-      }      $stillMissing = @($wl | Where-Object { $g = $_; -not ($foundGroups.ContainsKey($g)) })
+      }
+      $stillMissing = @(Get-QqMissingAliases -Groups $coverageGroups -Found $foundGroups)
 
       # 兜底（2026-10-26）：OCR 偶尔读到了群名、但 Get-QqSessionRows 的固定行距网格没把它
       #   解析成会话行 → 这个群一次都没被点到（实测 示例群B：原始行明明有「示例群B 有 限 集 团」，
@@ -1076,7 +1358,7 @@ function Invoke-QqMaaPass {
                 (Test-QqPrefix -name $t7 -pattern $g)
               })
             foreach ($c7 in $cands) {
-              if ($foundGroups.ContainsKey($g)) { break }
+              if (Test-QqLogicalGroupFound -Alias $g -Groups $coverageGroups -Found $foundGroups) { break }
               # 2026-10-27 修：点击 y 原来固定 +18，实测点在「群名文字」下沿、常常点到空隙，
               #   结果是进了群但读到的是空的/头部认不出（10-26 示例群B 那 13 条记录 10 条正文为空）。
               #   改成 30px（按抓图高度等比：抓图 1065 时实测 +30 能稳定进群并读到内容）。
@@ -1095,9 +1377,9 @@ function Invoke-QqMaaPass {
             }
           }
         } catch { Log ('    兜底点击失败：' + $_.Exception.Message) }
-        $stillMissing = @($wl | Where-Object { $g = $_; -not ($foundGroups.ContainsKey($g)) })
+        $stillMissing = @(Get-QqMissingAliases -Groups $coverageGroups -Found $foundGroups)
       }
-      if ($stillMissing.Count -gt 0) { Log ("  本轮没读到的白名单群：" + ($stillMissing -join '、') + "（不在可见列表里）") }
+      if ($stillMissing.Count -gt 0) { Log ("  本轮没读到的逻辑群：" + ((Get-QqMissingLogicalGroups -Groups $coverageGroups -Found $foundGroups | ForEach-Object { Format-QqLogicalGroup $_ }) -join '、')) }
     }
 
     # 收尾（2026-10-26 用户要求）：采集完如果还停在「群助手」子列表，自动点「返回」回群聊列表；
@@ -1197,7 +1479,27 @@ function Invoke-QqMaaPass {
 function Invoke-QqScreenPass {
   Log '===== QQ 采集 第 1 轮（屏幕截取模式）====='
   $w = Find-QqMainWindow
-  if (-not $w) { Log '跳过：没找到 QQ 主窗口（QQ 没运行 / 主面板没打开）'; $script:skipNote = 'QQ 未运行，本轮跳过（无窗口可采）'; return 0 }
+  if (-not $w) {
+    # 2026-11-06：原来一律写"QQ 未运行"，但实测经常是**进程在跑、只是主面板收进托盘**（vis=False）——
+    #   用户看到"QQ 未运行"会说"我 QQ 明明开着"。这里分开说，自检推送才准确。
+    $qqProcs = @(Get-Process -Name $cfg.processName -ErrorAction SilentlyContinue)
+    $why = if ($qqProcs.Count -gt 0) { 'QQ 主面板没打开（进程在跑，可能收进托盘了）' } else { 'QQ 没运行' }
+    # 顺手把候选窗口的可见性打出来：下次再出问题，能一眼看出是"收托盘"(vis=False) 还是"类名/标题变了"(根本没匹配)。
+    try {
+      $pidsQ = @($qqProcs | ForEach-Object { [UInt32]$_.Id })
+      $visCnt = 0; $hidCnt = 0; $otherCnt = 0
+      foreach ($ln in [WxNative]::ListTopWindows($pidsQ)) {
+        $pp = $ln -split '\|'
+        if ($pp[7] -eq $cfg.windowClass -and $pp[8] -eq $cfg.windowTitle) {
+          if ($pp[1] -eq 'True') { $visCnt++ } else { $hidCnt++ }
+        } else { $otherCnt++ }
+      }
+      Log ("  [诊断] 匹配类名/标题的窗口：可见 {0} 个、隐藏 {1} 个；其它窗口 {2} 个（进程 {3} 个）" -f $visCnt, $hidCnt, $otherCnt, $qqProcs.Count)
+    } catch { }
+    Log ('跳过：找不到可采集的 QQ 窗口 —— ' + $why)
+    $script:skipNote = $why + '，本轮跳过'
+    return 0
+  }
 
   $info = Get-WxWindowInfo -Hwnd $w.hwnd
   $hidden = ($null -eq $info) -or ($info.minimized) -or ($info.width -lt 300) -or ($info.height -lt 250)
@@ -1220,24 +1522,30 @@ function Invoke-QqScreenPass {
   if ($DumpRows) { foreach ($r in ($rows | Sort-Object y)) { Write-Host ("  y={0,4} x={1,4} | {2}" -f $r.y, $r.x, $r.text) } }
   if ($rows.Count -eq 0) {
     if ($cfg.topmostWhileCapture) { [void][WxNative]::SetWindowPos($w.hwnd, [IntPtr]::new(-2), 0, 0, 0, 0, 0x0043) }
+    $script:skipNote = 'QQ OCR 为空，本轮环境跳过'
     Log 'OCR 为空，跳过'; return 0
   }
 
   # ---------- 只读"当前已打开的那个群" ----------
   if ($ReadOpen -or $cfg.openChatOnly) {
+    # 2026-10-29：边界改走布局档案（像素常数 × DPI 系数），比例只做兜底 —— 见 wxlib 的 Get-QqLayoutProfile
+    $qp = Get-QqLayoutProfile -Win $info -Cfg $cfg
     $header = ''
-    foreach ($r in $rows) { if ($r.x -ge ($info.width * 0.5) -and $r.y -lt ($info.height * 0.25)) { $header = $r.text; break } }
-    $chatLines = @($rows | Where-Object { $_.x -ge ($info.width * [double]$cfg.chatXFrom) -and $_.y -ge ($info.height * [double]$cfg.chatYFrom) } | Sort-Object y)
+    foreach ($r in $rows) { if ($r.x -ge $qp.chatX -and $r.y -lt $qp.headerY) { $header = $r.text; break } }
+    $chatLines = @($rows | Where-Object { $_.x -ge $qp.chatX -and $_.y -ge ($info.height * [double]$cfg.chatYFrom) } | Sort-Object y)
     $msgText = (($chatLines | ForEach-Object { $_.text }) -join "`n").Trim()
     $wl0 = @($cfg.groupWhitelist | Where-Object { $_ })
     $hit = ''
-    foreach ($g in $wl0) { if (Test-QqMatch -name $header -pattern $g) { $hit = $g } }
+    foreach ($g in $wl0) { if (Test-QqHeaderExact -Name $header -Pattern $g) { $hit = $g } }
     Log ("当前打开的会话头部='" + $header + "' 命中白名单=" + $(if ($hit) { $hit } else { '否' }) + " 正文 " + $msgText.Length + " 字")
     if ($cfg.topmostWhileCapture) { [void][WxNative]::SetWindowPos($w.hwnd, [IntPtr]::new(-2), 0, 0, 0, 0, 0x0043) }
     if (-not $hit -or $msgText.Length -lt 4) {
       if (-not $Peek -and -not $SaveShots) { Remove-Item -LiteralPath (Join-Path $shotDir 'qq-list.png') -Force -ErrorAction SilentlyContinue }
+      $script:skipNote = 'QQ 当前打开会话未确认或正文不足，本轮环境跳过'
       return 0
     }
+    $logicalKey0 = Get-QqLogicalKey -Alias $hit -Groups @($script:QqRoundGroups)
+    $script:QqRoundFound[$logicalKey0] = $true
     $st0 = Get-StateMap $stateFile
     $md5 = [System.Security.Cryptography.MD5]::Create()
     $h = [BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($msgText))) -replace '-', ''
@@ -1262,7 +1570,8 @@ function Invoke-QqScreenPass {
   # ---------- 会话列表：粗筛候选 → 点击 → 头部判定 ----------
   $x1 = $info.width * [double]$cfg.sessionXFrom
   $x2 = $info.width * [double]$cfg.sessionXTo
-  $y0 = $info.height * [double]$cfg.listYFrom
+  $qprof = Get-QqLayoutProfile -Win $info -Cfg $cfg
+  $y0 = $qprof.listY
   $inList = @($rows | Where-Object { $_.x -ge $x1 -and $_.x -le $x2 -and $_.y -ge $y0 })
   Log ("列表区域内 {0} 行" -f $inList.Count)
 
@@ -1285,6 +1594,7 @@ function Invoke-QqScreenPass {
   $wl = @($cfg.groupWhitelist | Where-Object { $_ })
   $records = @()
   $newState = @{}
+  Initialize-QqRoundCoverage
   foreach ($c in $clusters) {
     $byY = @($c.lines | Sort-Object y)
     $nameLine = $byY[0]
@@ -1316,13 +1626,15 @@ function Invoke-QqScreenPass {
         Start-Sleep -Milliseconds ([int]$cfg.clickSettleMs)
         $pane = Get-ScreenRows -Left $info.left -Top $info.top -W $info.width -H $info.height -Tag 'read'
         $header = ''
-        foreach ($x in $pane.rows) { if ($x.x -ge ($info.width * 0.5) -and $x.y -lt ($info.height * 0.25)) { $header = $x.text; break } }
+        foreach ($x in $pane.rows) { if ($x.x -ge $qprof.chatX -and $x.y -lt $qprof.headerY) { $header = $x.text; break } }
         $hitGroup = ''
-        foreach ($g in $wl) { if (Test-QqMatch -name $header -pattern $g) { $hitGroup = $g } }
-        $chatLines = @($pane.rows | Where-Object { $_.x -ge ($info.width * [double]$cfg.chatXFrom) -and $_.y -ge ($info.height * [double]$cfg.chatYFrom) } | Sort-Object y)
+        foreach ($g in $wl) { if (Test-QqHeaderExact -Name $header -Pattern $g) { $hitGroup = $g } }
+        $chatLines = @($pane.rows | Where-Object { $_.x -ge $qprof.chatX -and $_.y -ge ($info.height * [double]$cfg.chatYFrom) } | Sort-Object y)
         $msgText = (($chatLines | ForEach-Object { $_.text }) -join "`n").Trim()
         Log ("  → 聊天头部'" + $header + "' 命中白名单=" + $(if ($hitGroup) { $hitGroup } else { '否' }) + " 正文 " + $msgText.Length + " 字")
         if ($hitGroup -and $msgText.Length -ge 4) {
+          $logicalKey = Get-QqLogicalKey -Alias $hitGroup -Groups @($script:QqRoundGroups)
+          $script:QqRoundFound[$logicalKey] = $true
           $realName = if ($header) { $header } else { $name }
           $rec = [ordered]@{
             kind = 'chat'; ts = (Get-Date).ToString('o'); source = 'qq-screen'
@@ -1337,11 +1649,9 @@ function Invoke-QqScreenPass {
       }
     }
     if (-not $rec) {
-      $rec = [ordered]@{
-        kind = 'preview'; ts = (Get-Date).ToString('o'); source = 'qq-screen'
-        chat = $name; preview = $preview; verified = $true; changed = $true
-        text = ($name + "`n" + $preview)
-      }
+      Log ('  [跳过·未确认正文] ' + $name)
+      if ($state.ContainsKey($key)) { $newState[$key] = $state[$key] } else { $newState.Remove($key) }
+      continue
     }
     $records += $rec
     Log ("  [收下] " + $name + "  kind=" + $rec.kind)
@@ -1364,6 +1674,8 @@ function Invoke-QqScreenPass {
 }
 
 function Invoke-QqPass {
+  Initialize-QqRoundCoverage
+  $script:QqWheelObstructed = $false
   # R1（2026-10-27 用户要求）：记录**本轮命令执行时间**，整轮只取一次。
   #   后面所有"昨天/今天/前天"的时间解析都以它为准（锚点时间判据也靠它）。
   $script:PassNow = Get-Date
@@ -1373,10 +1685,12 @@ function Invoke-QqPass {
   if ($mode -eq 'maa') { return (Invoke-QqMaaPass) }
   if ($mode -eq 'screen') { return (Invoke-QqScreenPass) }
   # auto：先试 Maa（后台、不抢前台）；不可用再退回屏幕截取
+  $script:MaaInitUnavailable = $false
   $script:MaaFailed = $false
   $n = Invoke-QqMaaPass
   if (-not $script:MaaFailed) { return $n }
   Log 'Maa 模式不可用 → 回退屏幕截取模式'
+  if ($script:MaaInitUnavailable) { $script:skipNote = 'Maa 不可用，回退到屏幕模式（当前会话范围有限）' }
   return (Invoke-QqScreenPass)
 }
 
@@ -1387,20 +1701,122 @@ function Invoke-QqPass {
 if (Get-Command Restore-QqIfMoved -ErrorAction SilentlyContinue) {
   if (Restore-QqIfMoved) { Write-Host '  [自愈] 检测到上次未还原，已把 QQ 窗口拖回原位' }
 }
+# ================= QQ 布局标定（-Calibrate，2026-10-29）=================
+# 与微信同一套思路：量出「列表宽度」和「列表上沿」的像素值（按 96DPI 折算存盘），
+# 之后无论系统缩放到 100%/125%/150%…，都按 像素常数 × DPI系数 换算，不再靠 chatXFrom=0.3 这种比例假设。
+function Invoke-QqCalibrate {
+  $mw = Find-QqMainWindow
+  if (-not $mw) { Write-Host '找不到 QQ 主窗口 —— 请先打开 QQ（主面板）再标定。'; return 1 }
+  $w = Get-WxWindowInfo -Hwnd $mw.hwnd
+  if ($null -eq $w -or $w.width -lt 200) { Write-Host 'QQ 窗口当前不可见/最小化，先恢复再标定。'; return 1 }
+  $f = Get-WxDpiFactorOf $w
+  Write-Host ''
+  Write-Host '=== QQ 布局标定 ==='
+  Write-Host ("窗口        : {0}x{1} @ ({2},{3})" -f $w.width, $w.height, $w.left, $w.top)
+  Write-Host ("DPI         : {0}（系数 {1:N2}）  感知={2}" -f $w.dpi, $f, $w.dpiAware)
+  $rows = @((Get-ScreenRows -Left $w.left -Top $w.top -W $w.width -H $w.height -Tag 'calibrate').rows)
+  Write-Host ("OCR 行数    : {0}" -f $rows.Count)
+  if ($rows.Count -eq 0) { Write-Host '⚠️ 一行都没认出来 → 确认 QQ 停在会话列表页再试'; return 1 }
+  # 列表上沿：列表区域内最靠上的一行（跳过顶部搜索框/标签栏）
+  $prof0 = Get-QqLayoutProfile -Win $w -Cfg $cfg
+  $listRows = @($rows | Where-Object { $_.y -ge [int]($w.height * 0.06) -and $_.x -le $prof0.chatX })
+  $listTop = if ($listRows.Count -gt 0) { [int](($listRows | Measure-Object -Property y -Minimum).Minimum) } else { $prof0.listY }
+  # 列表宽度：优先用"聊天区最靠左的那一簇"（打开着群时才有）；否则用列表行最右边界 + 余量
+  $chatRows = @($rows | Where-Object { $_.x -ge [int]($w.width * 0.25) -and $_.y -le $prof0.headerY -and -not [string]::IsNullOrWhiteSpace($_.text) })
+  $measured = 0; $how = '没打开群，按列表行最右边界估计'
+  if ($chatRows.Count -gt 0) {
+    $minY = [int](($chatRows | Measure-Object -Property y -Minimum).Minimum)
+    $cluster = @($chatRows | Where-Object { ([int]$_.y - $minY) -le 8 })
+    $measured = [int](($cluster | Measure-Object -Property x -Minimum).Minimum) - 6
+    $how = ('按聊天区群名左边界 x={0} 反推' -f ($measured + 6))
+  } else {
+    $right = 0
+    foreach ($r in $listRows) {
+      $len = (Format-OcrText $r.text).Length
+      $rw = [int]$r.x + ([int]$r.w * [Math]::Max($len, 1))
+      if ($rw -gt $right) { $right = $rw }
+    }
+    if ($right -gt 0) { $measured = $right + 8 }
+  }
+  if ($measured -le 0) { Write-Host '⚠️ 量不到列表宽度（列表区没认出内容）'; return 1 }
+  Write-Host ("列表宽度    : {0}px（96DPI 折算 {1}px；{2}）" -f $measured, [int][Math]::Round($measured / $f), $how)
+  Write-Host ("列表上沿    : {0}px（96DPI 折算 {1}px）" -f $listTop, [int][Math]::Round($listTop / $f))
+  $path = Get-QqLayoutProfilePath
+  $lines = @(
+    '# QQ 采集器 布局档案（由 采集器-QQ.ps1 -Calibrate 生成）'
+    ('# 生成时间 {0:yyyy-MM-dd HH:mm:ss}；窗口 {1}x{2}；DPI {3}（系数 {4:N2}）' -f (Get-Date), $w.width, $w.height, $w.dpi, $f)
+    '# 数值都是"96DPI 下的像素"，运行时按 当前DPI/96 换算 —— 换缩放不用重新标定。'
+    ('listWidthPx={0}' -f [int][Math]::Round($measured / $f))
+    ('listTopPx={0}' -f [int][Math]::Round($listTop / $f))
+    ('titleStripPx=110')
+    ('calibratedAt={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    ('calibratedWin={0}x{1}' -f $w.width, $w.height)
+    ('calibratedDpi={0}' -f $w.dpi)
+  )
+  [System.IO.File]::WriteAllLines($path, $lines, (New-Object System.Text.UTF8Encoding($true)))
+  $script:QqLayoutProfileCache = $null
+  Write-Host ''
+  Write-Host ("✅ 已写入布局档案：{0}" -f $path)
+  return 0
+}
+
+if ($Calibrate) {
+  $rc = Invoke-QqCalibrate
+  exit $rc
+}
+
+function Test-QqEnvSkip([string]$msg) {
+  <#
+    .SYNOPSIS  这个异常是"环境不满足 → 本轮跳过"，还是"代码崩了"
+    .DESCRIPTION
+      2026-11-04：为了不把滚轮发给别的应用，滚轮前要求 QQ 在前台（后台滚动还会先用截图验证）。
+      QQ 不在前台时必然停在这里 —— 那是**用户当时没把 QQ 切到前台**，不是脚本坏了。
+      原来一律记 code=1「本轮崩溃」，自检于是每小时红一次，真正的故障反而被淹掉。
+      只把"我们主动拒绝发输入"这两条算跳过，其余（截图无效/点击未完成/标题突变）仍按崩溃记。
+  #>
+  if ([string]::IsNullOrWhiteSpace($msg)) { return $false }
+  if ($msg -match 'QQ 无法取得前台') { return $true }
+  if ($msg -match '滚动点不在目标窗口上') { return $true }
+  if ($msg -match '滚轮候选点均被遮挡') { return $true }
+  return $false
+}
+
 if ($Once) {
   $script:skipNote = ''
   # 入口层兜底：Invoke-QqPass 里**任何**没被处理的异常都要留下 code=1 的运行状态（否则"崩了"和"没跑"在数据上一样，自检看不见）
-  try { [void](Invoke-QqPass) } catch { Log ('本轮崩溃：' + $_.Exception.Message); $script:skipNote = '本轮崩溃：' + $_.Exception.Message }
+  try { [void](Invoke-QqPass) } catch {
+    $msg = $_.Exception.Message
+    if (Test-QqEnvSkip $msg) {
+      Log ('本轮跳过（环境条件不满足，不是代码故障）：' + $msg)
+      $script:skipNote = 'QQ 窗口被其他窗口遮挡 → 本轮跳过滚动（把 QQ 露出来即可恢复）'
+    } else {
+      Log ('本轮崩溃：' + $msg); $script:skipNote = '本轮崩溃：' + $msg
+    }
+  }
   if (Get-Command Restore-QqIfMoved -ErrorAction SilentlyContinue) { [void](Restore-QqIfMoved) }
   $crash = ($script:skipNote -match '^本轮崩溃')
-  Write-RunStatus -Name '采集器-QQ' -Code $(if ($crash) { 1 } else { 0 }) -Note $script:skipNote
+  $roundStatus = if ($crash) { 'failure' } elseif ($script:QqWheelObstructed -or $script:skipNote) { 'env-skip' } else { 'complete' }
+  $round = Finish-QqRoundObservation -Status $roundStatus
+  $note = (($script:skipNote + ' ' + $round.note).Trim())
+  Write-RunStatus -Name '采集器-QQ' -Code $(if ($crash) { 1 } else { 0 }) -Note $note
   exit $(if ($crash) { 1 } else { 0 })
 }
 while ($true) {
   $script:skipNote = ''
-  try { [void](Invoke-QqPass) } catch { Log ('本轮崩溃：' + $_.Exception.Message); $script:skipNote = '本轮崩溃：' + $_.Exception.Message }
+  try { [void](Invoke-QqPass) } catch {
+    $msg = $_.Exception.Message
+    if (Test-QqEnvSkip $msg) {
+      Log ('本轮跳过（环境条件不满足，不是代码故障）：' + $msg)
+      $script:skipNote = 'QQ 窗口被其他窗口遮挡 → 本轮跳过滚动（把 QQ 露出来即可恢复）'
+    } else {
+      Log ('本轮崩溃：' + $msg); $script:skipNote = '本轮崩溃：' + $msg
+    }
+  }
   $crash = ($script:skipNote -match '^本轮崩溃')
-  Write-RunStatus -Name '采集器-QQ' -Code $(if ($crash) { 1 } else { 0 }) -Note $script:skipNote
+  $roundStatus = if ($crash) { 'failure' } elseif ($script:QqWheelObstructed -or $script:skipNote) { 'env-skip' } else { 'complete' }
+  $round = Finish-QqRoundObservation -Status $roundStatus
+  $note = (($script:skipNote + ' ' + $round.note).Trim())
+  Write-RunStatus -Name '采集器-QQ' -Code $(if ($crash) { 1 } else { 0 }) -Note $note
   Start-Sleep -Seconds $Interval
 }
 # ↑ 写在**入口这一层**：不管走 Maa / 屏幕模式 / Maa 失败回退 / 崩溃，每轮都会留下状态记录

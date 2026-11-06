@@ -1,4 +1,7 @@
-﻿# 测试-解析.ps1 —— 采集器 parser 的回归测试（离线喂 OCR fixture，不碰任何窗口）
+﻿# 离线 fixture 测试必须与本机真实档案无关：
+#   否则"这台机器标定过"会让 fixture 的解析结果漂移（2026-10-29 实测：档案说列表宽 318，
+#   而 fixture 的时间列在 x=337 → 6 个会话被切成 5 个）。设成 none = 完全按比例，结果确定。
+# 测试-解析.ps1 —— 采集器 parser 的回归测试（离线喂 OCR fixture，不碰任何窗口）
 #
 # 背景：parser 是整个项目最容易退化的部分（"未读角标冒充会话名"那个 bug 就让识别结果在
 # 0/2/6 个会话之间乱跳）。这里用真实的 OCR 快照（fixture）做断言，改动 parser 后一跑就知道有没有退化。
@@ -7,11 +10,15 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\测试-解析.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\测试-解析.ps1 -UpdateFixture   # 重新抓一份快照
 param([switch]$UpdateFixture)
+$env:WX_LAYOUT_PROFILE = 'none'
+$env:WX_LAYOUT_PROFILE_QQ = 'none'
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $collector = Join-Path $here '采集器.ps1'
 $fxDir = Join-Path $here 'fixtures'
-$logFile = Join-Path $here 'logs\last-pass.txt'
+# 2026-11-06：采集器的 fixture 运行（-OcrRows）不再写生产日志 last-pass.txt，
+#   而是写 last-pass-test.txt（否则测试会把生产那轮的现场盖掉）→ 这里跟着读隔离文件。
+$logFile = Join-Path $here 'logs\last-pass-test.txt'
 if (-not (Test-Path -LiteralPath $fxDir)) { New-Item -ItemType Directory -Force -Path $fxDir | Out-Null }
 
 # 加载库函数（下面"群名匹配方向"的断言要用 Test-ChatRuleMatch）
@@ -120,7 +127,30 @@ foreach ($c in $sameCases) {
   else { Write-Line ('❌ 同群判定错：「' + $c.a + '」对「' + $c.b + '」期望 ' + $c.want + ' 实际 ' + $mi.same + '（' + $mi.why + '）—— ' + $c.why); $fail++ }
 }
 
-# 断言 6：误入非聊天界面的检测（2026-10-15 加）
+# 断言 6：使用最终标题身份规则测试不同群隔离及已知 OCR 变体。
+# 直接调用 wxlib 的最终身份 helper；候选列表阶段仍由上面的 Get-ChatMatchInfo 单独覆盖。
+Write-Line ''
+Write-Line '--- 当前微信配置下的标题身份边界 ---'
+$configIdentityCases = @(
+  @{ a = '示例群A'; b = '示例群A3班'; want = $false; why = '不同班级不能因共享短白名单词「示例群A」而视为同群' },
+  @{ a = 'A社群2025通知'; b = 'A社群2026通知'; want = $false; why = '其他标题内容相同也不能掩盖不同年份数字标识' },
+  @{ a = '示例群B'; b = '示例群B校园群'; want = $false; why = '不同 示例群B 群不能因共享短白名单词「示例群B」而视为同群' },
+  @{ a = '26 示例群A 2 班灬'; b = '26 示例群A 2 班 <示例群号> （官方）（52）'; want = $false; why = '列表前缀未读到主群号且末字不符，不能以弱证据确认同群' },
+  @{ a = '26 示例群A 2 班 266'; b = '26 示例群A 2 班 <示例群号> （官方）（52）'; want = $true; why = '主群号相同且尾部号段被 OCR 截短' },
+  @{ a = '26 示例群A 2 班 <示例群号>'; b = '26 示例群A 2 班 <示例群号> （官方）（52）'; want = $true; why = '列表标题含有完整群号，允许后续官方后缀被截断' },
+  @{ a = '26 示例群A 2 班 群'; b = '26 示例群A 2 班 <示例群号> （官方）（52）'; want = $false; why = '同名语义后缀但缺少主群号，不允许误认为截断' },
+  @{ a = '26人工2毋形及群'; b = '26人工2班<OCR 错字示例>（50）'; want = $true; why = '已知群名头部 OCR 变体仍识别为同群' },
+  @{ a = '示例群A群'; b = '26示例群A3班群'; want = $false; why = '附加同一“示例群A”前缀的班级编号不同，不得越过数字冲突' },
+  @{ a = '示例群A群'; b = '示例群A<示例群号>官方（50）'; want = $false; why = '语义后缀及群号缺失不可当成列表截断，避免同名前缀误合并' },
+  @{ a = '示例群B（159）'; b = '示例群B有集团（159）'; want = $true; why = '已知 示例群B OCR 残字与群人数后缀变体仍识别为同群' }
+)
+foreach ($c in $configIdentityCases) {
+  $mi = Get-ChatFinalIdentityInfo -Actual $c.a -Expected $c.b
+  if ($mi.same -eq $c.want) { Write-Line ('✅ 配置标题身份：' + $c.why) }
+  else { Write-Line ('❌ 配置标题身份错：「' + $c.a + '」对「' + $c.b + '」期望 ' + $c.want + ' 实际 ' + $mi.same + '（' + $mi.why + '）—— ' + $c.why); $fail++ }
+}
+
+# 断言 7：误入非聊天界面的检测（2026-10-15 加）
 # 为什么：点进「群助手 / 服务通知」这类列表型界面后，后面所有行坐标都会错位、整轮白跑。
 # ⚠️ 关键是**第二类用例**：正常群名也可能带 "(数字)"（那是群人数），
 #    绝不能因为"尾部有括号数字"就判成非聊天界面 —— 误判会把正常群踢掉，比不检测更糟。

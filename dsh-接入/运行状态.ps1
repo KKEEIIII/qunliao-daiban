@@ -29,6 +29,7 @@ function Write-RunStatus {
     [Parameter(Mandatory = $true)][string]$Name,
     [int]$Code = 0,
     [string]$Note = '',
+    [ValidateSet('complete','env-skip','failure')][string]$Kind = '',
     [string]$Path = ''
   )
   try {
@@ -37,6 +38,7 @@ function Write-RunStatus {
       # （$PSScriptRoot 在函数里指向本文件所在目录 = dsh-接入）
       $Path = Join-Path $PSScriptRoot 'logs\运行状态.json'
     }
+    if (-not $Kind) { $Kind = if ($Code -ne 0) { 'failure' } else { 'complete' } }
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     $all = [ordered]@{}
@@ -50,6 +52,7 @@ function Write-RunStatus {
     $all[$Name] = [ordered]@{
       code = $Code
       at   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+      kind = $Kind
       note = $Note
     }
     # 无 BOM UTF-8（PS 的 Set-Content -Encoding UTF8 会写 BOM，别的读者会因此解析失败）

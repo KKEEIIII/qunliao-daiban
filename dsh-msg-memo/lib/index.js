@@ -222,11 +222,13 @@ function isCandidateRecord(record, cfg) {
 function prefilterRecords(records, cfg) {
   const on = cfg?.prefilter !== false
   const droppedUnverifiedRecords = []
+  const droppedUnchangedRecords = []
   if (!on) {
     return {
       kept: records,
       dropped: [],
       droppedUnverifiedRecords,
+      droppedUnchangedRecords,
       decisions: records.map((r) => ({ record: r, hits: ['prefilter-off'] })),
       enabled: false,
     }
@@ -235,6 +237,11 @@ function prefilterRecords(records, cfg) {
   const dropped = []
   const decisions = []
   for (const r of records) {
+    if (String(r?.kind ?? 'chat') === 'chat' && r?.source === 'wechat-screenshot-ocr' && r?.changed === false) {
+      droppedUnchangedRecords.push(r)
+      decisions.push({ record: r, hits: ['unchanged'] })
+      continue
+    }
     if (String(r?.kind ?? 'chat') === 'chat' && r?.verified === false) {
       droppedUnverifiedRecords.push(r)
       decisions.push({ record: r, hits: ['unverified'] })
@@ -245,7 +252,7 @@ function prefilterRecords(records, cfg) {
     if (keep) kept.push(r)
     else dropped.push(r)
   }
-  return { kept, dropped, droppedUnverifiedRecords, decisions, enabled: true }
+  return { kept, dropped, droppedUnverifiedRecords, droppedUnchangedRecords, decisions, enabled: true }
 }
 
 /** 把被筛掉的原文追加到 JSONL（可核对 / 可捞回），写不了就算了，不影响主流程 */
@@ -341,6 +348,38 @@ function findSupersetTarget(title, chat, due, items) {
   })
 }
 
+// ---- 2026-10-28 修「已完成的待办会重复出现」 ----
+// 根因：① buildPrompt 只把"未完成"清单喂给模型，模型不知道用户已经勾掉了哪些；
+// ② mergeTodos 的近重复判定**只看未完成条目**（`!['done','ignored']`），已完成的永远不参与比较；
+// ③ 采集器每小时重读群历史，同一段消息会以新的记录再送一次 → 模型把同一件事换个说法又输出一遍。
+// 结果：用户点了"完成"的事项，第二天以"新待办"的样子再冒出来（实测 10-27 的"示例部门大群回复1"被建成 4 条）。
+// 修法：按 **evidence（原文句子）** 判重 —— 同一条消息的 OCR 文本跨轮几乎不变，比标题可靠；
+// 已完成/忽略的条目在 N 天内也参与判重；如果新消息给了新的截止时间，则更新旧条目而不是新增。
+const RECENT_DONE_DAYS = 14
+
+function itemWhenMs(it) {
+  const w = Date.parse(String(it?.closedAt ?? it?.createdAt ?? ''))
+  return Number.isFinite(w) ? w : NaN
+}
+
+function isRecentDone(it, days = RECENT_DONE_DAYS) {
+  const st = String(it?.status ?? '')
+  if (st !== 'done' && st !== 'ignored') return false
+  const w = itemWhenMs(it)
+  return Number.isFinite(w) && Date.now() - w <= days * 86400000
+}
+
+// 同一条原文：归一化后相等，或"短的那句是长的那句的一部分且占比够大"，或只差几个字（OCR 抖动）。
+function evidenceSimilar(a, b) {
+  const x = normLoose(a)
+  const y = normLoose(b)
+  if (x.length < 8 || y.length < 8) return false
+  if (x === y) return true
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x]
+  if (long.includes(short) && short.length >= Math.max(8, Math.floor(long.length * 0.5))) return true
+  return editDistance(x, y) <= Math.max(2, Math.floor(short.length * 0.15))
+}
+
 function nowIso() {
   const d = new Date()
   const off = -d.getTimezoneOffset()
@@ -404,11 +443,19 @@ function collectNewRecords(paths, cursor, limit) {
 function compactRecords(records) {
   const groups = new Map()
   let droppedUnverified = 0
+  let droppedUnchanged = 0
   for (const r of records) {
     const chat = String(r?.chat ?? '').trim() || '(未知群)'
     const kind = String(r?.kind ?? 'chat')
     const text = String(r?.text ?? r?.preview ?? '').trim()
     if (!text) continue   // 空正文（OCR 没读到）不占用名额
+    // WeChat body hash explicitly marks unchanged pane snapshots. The spool cursor is line-based,
+    // so the consumer would otherwise reprocess changed=false records every run. Scope suppression
+    // to this known collector and explicit false; absent flags and other sources keep old semantics.
+    if (kind === 'chat' && r?.source === 'wechat-screenshot-ocr' && r?.changed === false) {
+      droppedUnchanged += 1
+      continue
+    }
     // 聊天正文只有 verified=true 才敢送模型：正文的群名是靠"点开后的聊天头部"认出来的，
     // 头部没认出来（verified=false）时这条正文可能属于**另一个群**（历史踩过：点串行 → 规则用错群），
     // 送进去等于制造"张冠李戴"的错误待办。预览行（会话列表那一行）自带群名，不看 verified。
@@ -440,6 +487,7 @@ function compactRecords(records) {
     raw: records.length,
     deduped: out.reduce((n, g) => n + g.deduped, 0),
     droppedUnverified,
+    droppedUnchanged,
     chars: out.reduce((n, g) => n + g.texts.join('').length, 0),
   }
 }
@@ -496,6 +544,18 @@ function buildPrompt(records, cfg, existing) {
       群: String(it?.chat ?? it?.source?.chat ?? ''),
       ...(it?.due ? { due: String(it.due) } : {}),
     }))
+  // 2026-10-28：把"最近 7 天已完成"也告诉模型 —— 否则同一段历史被重采时，模型会把用户已勾掉的事再抽一遍。
+  const priorDone = (Array.isArray(existing) ? existing : [])
+    .filter((it) => String(it?.status ?? '') === 'done')
+    .filter((it) => {
+      const w = Date.parse(String(it?.closedAt ?? ''))
+      return Number.isFinite(w) && Date.now() - w <= 7 * 86400000
+    })
+    .slice(-10)
+    .map((it) => ({
+      title: String(it?.title ?? ''),
+      群: String(it?.chat ?? it?.source?.chat ?? ''),
+    }))
   const out = [
     '你是待办抽取器。下面是从微信/QQ「截图 + OCR」采集到的群聊新消息。',
     'OCR 可能有错字、字间多余空格，请按语义纠正后再判断；不要照抄错字。',
@@ -512,12 +572,20 @@ function buildPrompt(records, cfg, existing) {
           '',
         ]
       : []),
+    ...(priorDone.length > 0
+      ? [
+          '最近 7 天已经完成的待办（用户已经处理过；下面消息如果只是同一条内容被重新采集，**不要输出**；除非消息明确给出了新的一轮任务/新的截止时间）：',
+          JSON.stringify(priorDone, null, 0),
+          '',
+        ]
+      : []),
     '规则：',
     '1. 只有明确的任务、承诺、请求或带时间点的约定才算待办；闲聊、表情、通知、转发链接、广告不算。',
     '2. 相对时间（"明天下午三点""下周一"）按下面的当前时间换算成绝对时间（时区 Asia/Shanghai）；换不出来的 due 填 null。',
     '3. confidence 如实填 0~1：拿不准就低，不要一律给高分。',
     '4. 同一条待办只输出一次；没有待办就输出 {"todos":[]}。',
-    '5. 与"已知未完成待办"实质相同的，**不要输出**；除非消息里给出了新的时间、地点或要求（那种情况请在 evidence 里写清新旧差别）。',
+    '5. 与"已知未完成待办"实质相同的，**不要输出**；与"最近已完成"实质相同的也**不要输出**（那是已处理的旧消息被重新采集）。' +
+      '只有消息里明确给出了新的一轮任务、或新的时间/地点/要求时，才输出（并在 evidence 里写清新旧差别）。',
     ...(extra ? ['', extra] : []),
     '',
     `当前时间：${nowIso()}`,
@@ -597,20 +665,36 @@ function mergeTodos(existing, incoming, records, onSkip) {
     }
     // 模糊去重：同一个群里"同一件事"被 OCR/模型读成两种说法时，不要重复建待办
     // （实测：一度出现 '参加示例部门见面会及培训' 与 '参加示例部门生见面会及第一次培训' 两条）
-    const nearDup = items.some(
-      (it) =>
-        !['done', 'ignored'].includes(String(it?.status)) &&
-        isNearDuplicate(
-          title,
-          chat,
-          dueOf,
-          it?.title,
-          it?.chat ?? it?.source?.chat ?? '',
-          it?.due ?? null,
-        ),
-    )
-    if (nearDup) {
-      onSkip?.(`近重复跳过（同群已有几乎相同的事项）：${title}（群 ${chat}）`)
+    // 2026-10-28：**已完成的条目也参与判重**，且优先用 evidence 判重 ——
+    //   否则"用户勾掉的事"会因为同一条消息被重采而以新待办的身份复活。
+    const ev = String(t?.evidence ?? '')
+    const dupIdx = items.findIndex((it) => {
+      const chatB = it?.chat ?? it?.source?.chat ?? ''
+      if (!sameChatLoose(chat, chatB)) return false
+      // 同一条原文：不管那条待办现在是 open / done / ignored，都算重复（最强信号）
+      if (evidenceSimilar(ev, it?.evidence)) return true
+      const st = String(it?.status ?? '')
+      if (st === 'done' || st === 'ignored') {
+        // 已完成/已忽略：只有在 N 天内、且标题几乎一模一样时才拦，避免把真·新一轮任务吞掉
+        if (!isRecentDone(it)) return false
+        const ta = normLoose(title)
+        const tb = normLoose(it?.title)
+        return ta.length >= 4 && tb.length >= 4 && editDistance(ta, tb) <= 2
+      }
+      return isNearDuplicate(title, chat, dueOf, it?.title, chatB, it?.due ?? null)
+    })
+    if (dupIdx >= 0) {
+      const old = items[dupIdx]
+      const st = String(old?.status ?? '')
+      // 同一件事给了新的截止时间（改期）：更新旧条目，不新增（已完成的不复活，避免"已办的事"又跳出来）
+      if (st !== 'done' && st !== 'ignored' && dueOf && String(old.due ?? '') !== dueOf) {
+        old.due = dueOf
+        if (ev) old.evidence = ev
+        if (t?.reason) old.reason = String(t.reason)
+        onSkip?.(`同一件事的新截止时间，已就地更新（不新增）：${old.title}（群 ${chat}）→ due ${dueOf}`)
+      } else {
+        onSkip?.(`重复跳过（这条消息已经抽过，当前状态 ${st}）：${title}（群 ${chat}）`)
+      }
       continue
     }
     seen.add(key)
@@ -767,6 +851,9 @@ async function runOnce(ctx, cfg) {
   // 所以既要落审计文件，也要在日志里留一条带字数的记录（将来发现漏抽，能据此把阈值放宽）。
   const pre = prefilterRecords(records, cfg)
   const droppedFile = cfg.prefilterLog ? join(paths.todoDir, String(cfg.prefilterLog)) : ''
+  if (pre.droppedUnchangedRecords.length > 0) {
+    log(`已跳过 ${pre.droppedUnchangedRecords.length} 条微信截图正文（采集器标记 changed=false）`)
+  }
   // 审计文件里要同时留痕"预筛筛掉的"和"群名没认出来没送的"两类 ——
   // 后者只记一条空 hits 会让人看不懂为什么被丢。
   if ((pre.dropped.length > 0 || pre.droppedUnverifiedRecords.length > 0) && cfg.prefilterDumpDropped !== false) {
@@ -942,3 +1029,6 @@ export function apply(ctx, config = {}) {
   // 暴露一个服务，方便以后加"立刻跑一轮"的入口
   return { run: () => runOnce(ctx, cfg), config: cfg }
 }
+
+// 给离线测试用（不对外承诺稳定性）
+export const __internals = { mergeTodos, isNearDuplicate, evidenceSimilar, isRecentDone, prefilterRecords, compactRecords }

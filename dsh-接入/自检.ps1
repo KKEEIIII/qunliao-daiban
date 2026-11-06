@@ -63,6 +63,88 @@ function Add-Check([string]$name, [string]$level, [string]$detail) {
   $checks.Add([pscustomobject]@{ name = $name; level = $level; detail = $detail })
 }
 
+# 2026-11-06：推送内容要短。以前是"每条检查整段"（十几行），手机上抓不住重点。
+# 现在推送只写「哪里有问题」（每项一句话），正常的只报个数；完整明细留在 自检.log。
+function Compress-Detail([string]$d) {
+  if ([string]::IsNullOrWhiteSpace($d)) { return '' }
+  $t = ($d -replace "`r?`n", ' ').Trim()
+  # ① 去掉"→ 怎么修"（操作建议留日志）
+  $i = $t.IndexOf('→'); if ($i -gt 0) { $t = $t.Substring(0, $i) }
+  # ② 去掉括号补充说明（全角/半角）——它们对"哪里有毛病"没帮助
+  $t = [regex]::Replace($t, '（[^）]*）', '')
+  $t = [regex]::Replace($t, '\([^)]*\)', '')
+  # ③ '｜' 分隔的细节只留前两段
+  $parts = @($t -split '｜' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($parts.Count -gt 2) { $parts = @($parts[0], $parts[1]) }
+  $t = ($parts -join '｜').Trim().TrimEnd('；', ';', '，', ',', '。', '、').Trim()
+  if ($t.Length -gt 46) { $t = $t.Substring(0, 46) + '…' }
+  return $t
+}
+
+# 汇总 QQ 轮次 JSONL：只有 status=complete 计入覆盖率/连续漏读；env-skip 与 failure 不算一次漏读。
+function Get-QqCoverageHealth {
+  param(
+    [string]$Path,
+    [int]$WindowHours = 24,
+    [int]$MissStreakThreshold = 2,
+    [datetime]$Now = [datetime]::MinValue
+  )
+  if ($Now -eq [datetime]::MinValue) { $Now = Get-Date }
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return [pscustomobject]@{ level = 'yellow'; detail = '尚无 QQ 轮次覆盖数据（首次新版本采集后生成）' }
+  }
+  try {
+    $rows = @()
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+      if ([string]::IsNullOrWhiteSpace($line)) { continue }
+      $r = $line | ConvertFrom-Json -ErrorAction Stop
+      if ([string]$r.status -notin @('complete','env-skip','failure')) { continue }
+      $at = [datetime]::MinValue
+      if (-not [datetime]::TryParse([string]$r.at, [ref]$at)) { continue }
+      $groups = if ($r.groups -is [string]) { @([string]$r.groups) } else { @($r.groups | ForEach-Object { [string]$_ }) }
+      $success = if ($r.success -is [string]) { @([string]$r.success) } else { @($r.success | ForEach-Object { [string]$_ }) }
+      $missed = if ($r.missed -is [string]) { @([string]$r.missed) } else { @($r.missed | ForEach-Object { [string]$_ }) }
+      $rows += [pscustomobject]@{ at = $at; status = [string]$r.status; groups = $groups; success = $success; missed = $missed }
+    }
+    $rows = @($rows | Sort-Object at)
+    $cutoff = $Now.AddHours(-$WindowHours)
+    $recent = @($rows | Where-Object { $_.status -eq 'complete' -and $_.at -ge $cutoff })
+    if ($recent.Count -eq 0) {
+      return [pscustomobject]@{ level = 'yellow'; detail = ('近 {0} 小时没有完整 QQ 覆盖轮次（环境跳过/失败不计覆盖）' -f $WindowHours) }
+    }
+    $groupSet = @{}
+    foreach ($round in $recent) { foreach ($g in $round.groups) { if ($g) { $groupSet[$g] = $true } } }
+    $summaries = @(); $warnings = @()
+    foreach ($g in @($groupSet.Keys | Sort-Object)) {
+      $attempts = @($recent | Where-Object { $_.groups -contains $g })
+      $okCount = @($attempts | Where-Object { $_.success -contains $g }).Count
+      $missCount = @($attempts | Where-Object { $_.missed -contains $g }).Count
+      $pct = if ($attempts.Count -gt 0) { [int][Math]::Round(100.0 * $okCount / $attempts.Count) } else { 0 }
+      $summaries += ('{0} {1}/{2}（{3}%）' -f $g, $okCount, $attempts.Count, $pct)
+      if ($missCount -gt 0) { $warnings += ('{0} 近24h有漏读' -f $g) }
+    }
+    # 连续漏读按完整采集轮次序列计算；env-skip/failure 刻意略过，不增也不清空 streak。
+    $allGroups = @{}
+    foreach ($round in $rows | Where-Object { $_.status -eq 'complete' }) { foreach ($g in $round.groups) { if ($g) { $allGroups[$g] = 0 } } }
+    foreach ($g in @($allGroups.Keys)) {
+      $streak = 0
+      foreach ($round in $rows | Where-Object { $_.status -eq 'complete' }) {
+        if ($round.groups -notcontains $g) { continue }
+        if ($round.missed -contains $g) { $streak++ }
+        elseif ($round.success -contains $g) { $streak = 0 }
+      }
+      $allGroups[$g] = $streak
+      if ($streak -ge $MissStreakThreshold) { $warnings += ('{0} 连续漏读 {1} 轮' -f $g, $streak) }
+    }
+    $level = if ($warnings.Count -gt 0) { 'yellow' } else { 'green' }
+    $detail = ('近 {0} 小时完整轮次 {1} 轮；逻辑群成功率：{2}' -f $WindowHours, $recent.Count, ($summaries -join '；'))
+    if ($warnings.Count -gt 0) { $detail += '｜关注：' + (($warnings | Select-Object -Unique) -join '；') }
+    return [pscustomobject]@{ level = $level; detail = $detail }
+  } catch {
+    return [pscustomobject]@{ level = 'yellow'; detail = ('QQ 轮次覆盖日志无法解析：{0}' -f $_.Exception.Message) }
+  }
+}
+
 # ---------- 0c. 版本：是不是最新版（2026-10-18 加） ----------
 # 目的：让"装了旧版的人"自己看到「请安装最新版本」，不依赖他记得看文档。
 # 做法：本机版本（版本.txt）vs GitHub 最新 Release 的 tag。
@@ -383,8 +465,9 @@ if (Test-Path -LiteralPath $collectorLog) {
   $lastC = $clog[-1]
   $cmt = (Get-Item -LiteralPath $collectorLog).LastWriteTime
   $cage = [int]((Get-Date) - $cmt).TotalMinutes
-  if ($latestPass -match '跳过：微信窗口当前不可见') {
-    Add-Check '采集器' 'yellow' ("上一轮跳过了：{0}" -f ($latestPass | Where-Object { $_ -match '跳过' } | Select-Object -Last 1))
+  # 环境跳过（只看最新一轮）：兼容旧版“当前不可见”和新版“不可用（原因）”。
+  if ($latestPass -match '跳过：微信(?:窗口不可用|未运行|窗口(?:当前不可见|不可用))') {
+    Add-Check '采集器' 'yellow' ("上一轮跳过了：{0}" -f ($latestPass | Where-Object { $_ -match '跳过：微信(?:窗口不可用|未运行|窗口(?:当前不可见|不可用))' } | Select-Object -Last 1))
   } elseif ($cage -le $StaleMinutes) {
     Add-Check '采集器' 'green' ("最近一轮 {0} 分钟前" -f $cage)
   } else {
@@ -572,6 +655,7 @@ if (Test-Path -LiteralPath $rsFile) {
     $rs = ([System.IO.File]::ReadAllText($rsFile, [System.Text.Encoding]::UTF8) -replace "^\uFEFF", '') | ConvertFrom-Json
     $bad = @()
     $stale = @()
+    $envSkips = @()
     $seen = 0   # 有几个脚本留下了记录（用来区分'都成功'和'还都没跑过'）
     $neverRan = @()   # ⚠️ 2026-10-15 深夜新增：任务**跑过**却从没留下运行状态记录 = 疑似"一启动就崩"（外部复测 2136 版抓的盲区）
     # 名字 → 计划任务 + 该任务应写的日志（用来判断"跑过没留痕"；提醒器此前漏覆盖，外部审查点名，已补）
@@ -594,6 +678,7 @@ if (Test-Path -LiteralPath $rsFile) {
         $at = [datetime]::MinValue
         $ok = [datetime]::TryParse([string]$v.at, [ref]$at)
         if ([int]$v.code -ne 0) { $bad += ("{0}={1}（{2}）" -f $nm, $v.code, $v.note) }
+        elseif ($nm -eq '采集器-微信' -and (($v.PSObject.Properties['kind'] -and [string]$v.kind -eq 'env-skip') -or [string]$v.note -match '^环境跳过：')) { $envSkips += ("{0}环境跳过（{1}）" -f $nm, $v.note) }
         elseif ($ok -and ((Get-Date) - $at).TotalHours -gt 6) { $stale += ("{0}（{1:HH:mm}）" -f $nm, $at) }
         continue
       }
@@ -610,6 +695,8 @@ if (Test-Path -LiteralPath $rsFile) {
     }
     if ($bad.Count -gt 0) {
       Add-Check '运行状态' 'red' ("有脚本上一轮失败了：{0}｜看 dsh-接入\logs\ 下对应日志" -f ($bad -join '；'))
+    } elseif ($envSkips.Count -gt 0) {
+      Add-Check '运行状态' 'yellow' ("最近一轮采集因环境条件跳过：{0}" -f ($envSkips -join '；'))
     } elseif ($neverRan.Count -gt 0) {
       # 任务确实跑过（LastRunTime 有效或日志文件在），但运行状态里从来没有它的记录 → 疑似脚本启动即崩
       # （如 QQ 采集器缺 VC++ 运行库时 DllNotFoundException 直接穿透）。用黄灯：不排除"用户手动跑过一两次"
@@ -639,6 +726,41 @@ if (Test-Path -LiteralPath $rsFile) {
   Add-Check '运行状态' 'yellow' '还没有业务脚本的运行记录（采集器/提醒器还没跑过；不是故障）→ 本轮已写入一条最小记录自证写盘链路'
   try { Write-RunStatus -Name '自检链路验证' -Code 0 -Note '由自检写入的最小记录' } catch { }
 }
+# ---------- 5c. QQ 白名单覆盖与连续漏读 ----------
+# 覆盖数据只统计采集器写入的完整轮次；遮挡/环境跳过及 code=1 失败轮不会被算作漏读。
+$qqRounds = Join-Path $ws 'wx-采集器\state\qq-rounds.jsonl'
+$qqCoverage = Get-QqCoverageHealth -Path $qqRounds -WindowHours 24 -MissStreakThreshold 2
+# 2026-11-06：黄灯要写清"为什么"。覆盖率为 0 时，真实原因通常在采集器自己写的运行状态里
+#   （实测：`QQ 未运行，本轮跳过（无窗口可采）`）。把它带进来，手机上才能一眼看出该干什么。
+$qqDetail = [string]$qqCoverage.detail
+if ($qqCoverage.level -ne 'green') {
+  try {
+    $qqNote = ''
+    $rsForQq = Join-Path $BaseDir 'logs\运行状态.json'
+    if (Test-Path -LiteralPath $rsForQq) {
+      $rsQq = ([System.IO.File]::ReadAllText($rsForQq, [System.Text.Encoding]::UTF8) -replace "^\uFEFF", '') | ConvertFrom-Json
+      $node = $rsQq.PSObject.Properties['采集器-QQ']
+      if ($node -and $node.Value -and $node.Value.note) { $qqNote = [string]$node.Value.note }
+    }
+    # 2026-11-06：推送要"说真话"——
+    #   ① 真的没有完整轮次 → 用运行状态里的原因（面板没开 / 进程没跑）+ 一句结论
+    #   ② 有完整轮次但有漏读 → 直接点名漏了哪些群（从 detail 的「关注：…」里抽）
+    $missGroups = @([regex]::Matches($qqDetail, '([^；｜]+?)\s*近\s*24h有漏读') |
+      ForEach-Object { ($_.Groups[1].Value -replace '^\s*关注\s*[:：]\s*', '').Trim() } |
+      Where-Object { $_ })
+    if ($missGroups.Count -gt 0) {
+      $qqDetail = '近 24h 漏读：' + (($missGroups | Select-Object -Unique) -join '、')
+    } elseif ($qqDetail -match '没有完整 QQ 覆盖轮次') {
+      if ($qqNote) {
+        $short = [regex]::Replace($qqNote, '（[^）]*）', '').Trim()
+        $short = [regex]::Replace($short, '^\s*QQ\s*覆盖\s*', '')
+        if ($short) { $qqDetail = $short + '｜近 24h 无完整轮次' }
+      }
+    }
+  } catch { }
+}
+Add-Check 'QQ覆盖' $qqCoverage.level $qqDetail
+
 # ---------- 6. 待办概览 ----------
 $todoFile = Join-Path $ws '群聊待办\todos.json'
 if (Test-Path -LiteralPath $todoFile) {
@@ -810,8 +932,21 @@ $daytime = ((Get-Date).Hour -ge 8 -and (Get-Date).Hour -lt 23)
 $degradeAlert = ($modelDegrade.Count -gt 0 -and $daytime)
 if ($degradeAlert) { $needAlert = $true }
 
-$body = ($checks | ForEach-Object { "{0}: {1}" -f $_.name, $_.detail }) -join "`n"
-$title = "群聊待办自检 · $overall"
+# ---- 推送正文（2026-11-06 精简：只点明"哪里有问题"，其余带过）----
+$badChecks = @($checks | Where-Object { $_.level -ne 'green' })
+$greenCount = @($checks | Where-Object { $_.level -eq 'green' }).Count
+$badLines = @()
+foreach ($c in $badChecks) {
+  $mark = if ($c.level -eq 'red') { '【红灯】' } else { '【黄灯】' }
+  $badLines += ('{0}{1}：{2}' -f $mark, $c.name, (Compress-Detail $c.detail))
+}
+$tailLine = if ($badChecks.Count -eq 0) { ('全部 {0} 项正常' -f $greenCount) } else { ('其余 {0} 项正常' -f $greenCount) }
+$body = (@($badLines) + @($tailLine)) -join "`n"
+$title = '自检 {0} · {1}红/{2}黄/{3}绿' -f $overall, $reds.Count, $yellows.Count, $greenCount
+
+# 把"将要推出去的内容"写进日志：用户问"到底推了什么"时能逐字核对（也便于我核对数值是否真实）。
+Log ('推送内容：' + $title)
+foreach ($ln in ($body -split "`n")) { Log ('  | ' + $ln) }
 
 Write-RunStatus -Name '自检' -Code 0   # 只表示'自检脚本本身跑完了'；发现问题由各项检查表达（写 1 会自我判红、死循环）   # 放在 -Quiet 早退之前，否则 -Quiet 模式写不到
 if ($Quiet) { Log '（-Quiet：不推送）'; exit 0 }
@@ -837,7 +972,7 @@ if (($needAlert -or $Force) -and -not $suppress) {
   $tb = New-Object System.Windows.Forms.TextBox
   $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Vertical'; $tb.Dock = 'Fill'
   $tb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-  $tb.Text = $body
+  $tb.Text = $body + "`n`n（完整明细在 dsh-接入\logs\自检.log）"
   $f.Controls.Add($tb); $f.Show()
   $sw = [Diagnostics.Stopwatch]::StartNew()
   while ($sw.Elapsed.TotalSeconds -lt 12) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 120 }

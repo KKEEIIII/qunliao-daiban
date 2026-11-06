@@ -27,7 +27,8 @@ param(
   [string]$OcrRows = '',        # 用 fixture 代替实时抓图（离线跑 parser，供回归测试）
   [switch]$ScanMentions,      # 只扫描"@谁"的候选，方便配 myAliases，不采集
   [string]$ConfigPath = '',     # 指定配置文件（默认 config.json）。回归测试用来试不同开关，不动线上配置
-  [switch]$Peek               # 只看不写：不写 spool、不更新 state（文档/回归测试/自测清单都用它）
+  [switch]$Peek,              # 只看不写：不写 spool、不更新 state（文档/回归测试/自测清单都用它）
+  [switch]$Calibrate          # 只标定布局：量出窗口/DPI/列表宽度/标题条/行距，写 layout-profile.txt 后退出
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,7 +60,9 @@ $defaultConfig = [ordered]@{
   rowGap         = 35        # 会话行的 y 间隔阈值（像素，窗口坐标系）
   clickX         = 0.25      # 点击会话行时的 x（窗口宽度比例）
   clickSettleMs  = 1100      # 点击后等待渲染
-  ignoreChats    = @('公众号', '服务号', '订阅号', '折叠的聊天', '折叠的群聊', '微信团队', 'QQ邮箱提醒', '微信支付', '文件传输助手', '群助手', '服务通知', '订阅号消息')
+  # 2026-11-06：加「折叠置顶聊天/置顶聊天」——它是列表里的一条 UI 分隔行，会被当成会话识别；
+  #   一旦被点开，置顶区就折叠成一行，视野外的置顶群全部消失（症状="好几个群忽然采不到了"）。
+  ignoreChats    = @('公众号', '服务号', '订阅号', '折叠的聊天', '折叠的群聊', '折叠置顶聊天', '置顶聊天', '微信团队', 'QQ邮箱提醒', '微信支付', '文件传输助手', '群助手', '服务通知', '订阅号消息')
   maxPreviewLen  = 200
   scale          = 3                          # OCR 放大倍数
   groupWhitelist = @()                        # 只采集名字包含其中任一项的会话；空 = 不过滤
@@ -75,7 +78,8 @@ $defaultConfig = [ordered]@{
   nonChatMarkers = @('群助手', '服务通知', '订阅号消息', '公众号', '微信团队')
 }
 if (-not (Test-Path -LiteralPath $configPath)) {
-  $defaultConfig | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $configPath -Encoding UTF8
+  $defaultJson = $defaultConfig | ConvertTo-Json -Depth 4
+  [System.IO.File]::WriteAllText($configPath, $defaultJson, (New-Object System.Text.UTF8Encoding($false)))
 }
 $cfg = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 # OCR 放大倍数：放大后 Windows OCR 对小字、中文行分割更准（坐标会自动除回来）
@@ -89,7 +93,12 @@ function Load-Json($path, $fallback) {
   if (-not (Test-Path -LiteralPath $path)) { return $fallback }
   try { return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $fallback }
 }
-function Save-Json($path, $obj) { $obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8 }
+function Save-Json($path, $obj) {
+  $json = $obj | ConvertTo-Json -Depth 6
+  $tmp = $path + '.tmp'
+  [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+  Move-Item -LiteralPath $tmp -Destination $path -Force
+}
 function Norm([string]$s) { if ($null -eq $s) { return '' } return ($s -replace '\s', '') }
 
 # R1（2026-10-27 用户要求）：采集器必须知道**命令执行时间**。
@@ -102,6 +111,46 @@ function Get-PassNow {
 }
 
 $script:logLines = New-Object System.Collections.Generic.List[string]
+$script:WxPseudoState = $null
+$script:WxRestoreAfterPass = $null
+$script:WxPassForeground = [IntPtr]::Zero
+$script:WxPassHwnd = [IntPtr]::Zero
+$script:WxStatusKind = ''
+function Clear-WxPseudoState {
+  $s = $script:WxPseudoState
+  if ($null -ne $s) {
+    try {
+      [void](Exit-WxPseudoMinimize -Hwnd $s.hwnd -OldExStyle $s.oldExStyle -OldColorKey $s.oldColorKey -OldAlpha $s.oldAlpha -OldLayerFlags $s.oldLayerFlags -HadLayerAttrs:([bool]$s.hadLayerAttrs) -RestoreState $s.restoreState)
+      $script:WxPseudoState = $null
+    } catch {
+      Log ('⚠️ 伪最小化恢复异常（保留状态供外层重试）：' + $_.Exception.Message)
+      throw
+    }
+  }
+  $r = $script:WxRestoreAfterPass
+  if ($null -ne $r) {
+    try {
+      if ([string]$r.restoreState -eq 'minimize' -or $r.minimized) { [void](Minimize-WxWindow -Hwnd $r.hwnd) }
+      elseif ([string]$r.restoreState -eq 'hide' -or -not $r.visible) { [void][WxNative]::ShowWindow($r.hwnd, 0) }
+      $script:WxRestoreAfterPass = $null
+    } catch {
+      Log ('⚠️ 采集器恢复原始微信窗口状态失败（保留状态供外层重试）：' + $_.Exception.Message)
+      throw
+    }
+  }
+  if ($script:WxPassForeground -ne [IntPtr]::Zero) {
+    try {
+      if ($script:WxPassHwnd -eq [IntPtr]::Zero -or $script:WxPassForeground -ne $script:WxPassHwnd) {
+        [void](Set-WxForegroundRaw -Hwnd $script:WxPassForeground)
+      }
+      $script:WxPassForeground = [IntPtr]::Zero
+      $script:WxPassHwnd = [IntPtr]::Zero
+    } catch {
+      Log ('⚠️ 恢复采集前台窗口失败（保留句柄供外层重试）：' + $_.Exception.Message)
+      throw
+    }
+  }
+}
 function Log([string]$msg) {
   $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg
   Write-Host $line
@@ -118,17 +167,23 @@ function Convert-WxChatRows {
       缩放 0.5× 只剩 2 个会话、2× 变成 11 个（真值 6 个）。
   #>
   param(
-    [Parameter(Mandatory = $true)][object[]]$SessionLines,
+    # 2026-10-29：加 [AllowEmptyCollection()] —— OCR 某次解析出 0 行会话时，PowerShell 会把
+    #   空数组当成"不能绑定的值"直接抛 "Cannot bind argument to parameter 'SessionLines'
+    #   because it is an empty array."，整轮采集作废（外部复测在 150% 缩放机器上实测到）。
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$SessionLines,
     [Parameter(Mandatory = $true)][double]$RowGap,
     [Parameter(Mandatory = $true)]$Cfg,
     [Parameter(Mandatory = $true)][double]$WinW
   )
+  if ($null -eq $SessionLines -or @($SessionLines).Count -eq 0) { return @() }
   $chats = @()
   $cur = $null
   foreach ($ln in ($SessionLines | Sort-Object y)) {
     $text = Format-OcrText $ln.text
     if ([string]::IsNullOrWhiteSpace($text)) { continue }
-    $item = [pscustomobject]@{ t = $text; h = [int]$ln.h; y = [int]$ln.y; x = [int]$ln.x }
+    # x2 = 整行右边界（2026-11-06 加）：点击前"整行复读"要按它裁图；
+    #   老 fixture 没有这个字段，[int]$null 会得到 0，裁剪函数会退回比例兜底。
+    $item = [pscustomobject]@{ t = $text; h = [int]$ln.h; y = [int]$ln.y; x = [int]$ln.x; x2 = [int]$ln.x2 }
     if ($null -eq $cur -or ($ln.y - $cur.lastY) -gt $RowGap) {
       if ($null -ne $cur) { $chats += $cur }
       $cur = [pscustomobject]@{ y = $ln.y; lastY = $ln.y; lines = @($item) }
@@ -149,8 +204,11 @@ function Convert-WxChatRows {
   # 靠 x 位置区分：角标在头像左边（x≈54~115 / 窗口宽 894），名字列在 x≈156 起。
   # ↑ 这两个数是**窗口像素**，所以这里用比例（nameXFrom）而不是绝对值 —— 换分辨率才不会失效。
   $badgeRe = if ($Cfg.PSObject.Properties.Name -contains 'badgePattern' -and $Cfg.badgePattern) { [string]$Cfg.badgePattern } else { '^\d+[+Ww]?$' }
-  $nameXMin = 0
-  if ($Cfg.PSObject.Properties.Name -contains 'nameXFrom' -and $Cfg.nameXFrom) { $nameXMin = [int]($WinW * [double]$Cfg.nameXFrom) }
+  # 2026-10-29（第二轮）：名字列起点改成**从行数据里量**（角标簇与名字簇之间的第一处明显空隙）。
+  #   原来用比例 nameXFrom=0.145：150%（窗口 1341）算成 194，而名字列实际在 188 ——
+  #   于是真名就叫 "212" 的会话会被当成未读角标**丢掉**。实测两个缩放都量对了：
+  #   894 宽 → 135（名字 156）、1341 宽 → 163（名字 188）。
+  $nameXMin = Get-WxNameXMinFromRows -SessionLines $SessionLines -WinW $WinW -Cfg $Cfg
   $previewRe = if ($Cfg.PSObject.Properties.Name -contains 'previewPattern' -and $Cfg.previewPattern) { [string]$Cfg.previewPattern } else { '^[^：:]{2,16}[：:]\s*\S' }
   $maxPreviewLen = if ($Cfg.maxPreviewLen) { [int]$Cfg.maxPreviewLen } else { 200 }
 
@@ -163,7 +221,7 @@ function Convert-WxChatRows {
       if ($t -match '^[^\p{L}\p{N}]+$') { continue }                     # 只有标点/符号（OCR 噪声）
       $isBadgeText = ($t -match $badgeRe) -or ($t -match '^\d{1,4}(?=[^\d\s])')
       if ($isBadgeText -and ($nameXMin -le 0 -or $ln.x -lt $nameXMin)) { continue }
-      $cand += [pscustomobject]@{ t = $t; h = $ln.h; y = $ln.y; x = $ln.x }
+      $cand += [pscustomobject]@{ t = $t; h = $ln.h; y = $ln.y; x = $ln.x; x2 = $ln.x2 }
     }
     if ($cand.Count -eq 0) { continue }                        # 这一"行"整个是角标 → 不是会话
 
@@ -182,7 +240,13 @@ function Convert-WxChatRows {
     #    于是"字号最大"会挑中预览行，把会话名记成 '示例成员A：[图片]'。
     #    真正稳的信号是**文本形态**：预览行几乎都是"发言人：内容"的样子（含冒号且冒号前 ≥2 字），
     #    或"已支付¥…"这类系统文案；群名基本不含冒号。
-    $nameLike = @($cand | Where-Object { $_.t -notmatch $previewRe -and $_.t -notmatch '^已(支付|收款|领取)' })
+    $nameLike = @($cand | Where-Object {
+      $_.t -notmatch $previewRe -and $_.t -notmatch '^已(支付|收款|领取)' -and
+      # 时间/日期标签不能当群名（整段只有时间才算，避免把「周三开会」这种真群名滤掉）
+      $_.t -notmatch '^\d{1,2}[:：]\s*\d{2}$' -and
+      $_.t -notmatch '^(昨天|今天|前天)(\s*\d{1,2}[:：]\s*\d{2})?$' -and
+      $_.t -notmatch '^(星期|周)[一二三四五六日天]?(\s*\d{1,2}[:：]\s*\d{2})?$'
+    })
     $pool = if ($nameLike.Count -gt 0) { $nameLike } else { $cand }   # 全像预览时退回全部候选
 
     $maxIdx = 0
@@ -215,6 +279,10 @@ function Convert-WxChatRows {
       nameY = [int]$pool[$maxIdx].y
       # 2026-10-27：名字行的字高也带出去 —— 点击偏移按它折算，就不再依赖"窗口像素 +8"这种定值
       nameH = [int]$pool[$maxIdx].h
+      # 2026-11-06：名字行的横向范围也带出去 —— 点击前"整行复读"按它裁图，
+      #   否则只能按比例裁整列，会把右边的角标/时间一起读进来，复读文本被污染。
+      nameX = if ($pool[$maxIdx].PSObject.Properties['x']) { [int]$pool[$maxIdx].x } else { 0 }
+      nameX2 = if ($pool[$maxIdx].PSObject.Properties['x2']) { [int]$pool[$maxIdx].x2 } else { 0 }
       lineCount = @($cand).Count
     }
   }
@@ -301,8 +369,30 @@ function Get-ChatsFromRows($rows) {
   <# 把 OCR 行按 x 分到「会话列表」和「聊天区」，再把会话列表行按 y 聚成会话行 #>
   $win = $script:win
   $sxFrom = [int]($win.width * $cfg.sessionXFrom)
-  $sxTo = [int]($win.width * $cfg.sessionXTo)
-  $cxFrom = [int]($win.width * $cfg.chatXFrom)
+  # 2026-10-29（第二轮）：默认分界不再用"窗口宽度比例"，改用**布局档案**
+  #   （部署时标定出的「列表宽度」像素常数 × 当前 DPI 系数）。比例模型错在假设
+  #   "UI 随窗口等比缩放"，而微信的会话列表是近似固定像素宽的 —— 窗口一宽，
+  #   0.42W 就切进聊天面板，群名被切掉、点击落到标题栏。详见 wxlib 的 Get-WxLayoutProfile。
+  $prof = Get-WxLayoutProfile -Win $win -Cfg $cfg
+  $defSplit = [int]$prof.splitX
+  if ($script:WxSplitOverride -gt 0) {
+    # 失败自搜索：上一轮"点开读不到本意群"时，按候选分界线重试
+    $splitTo = [int]$script:WxSplitOverride
+    Log ("  分界线改用候选值 {0}（自搜索第 {1} 个）" -f $splitTo, $script:WxSplitTry)
+  } else {
+    $splitTo = Get-WxChatSplitX -Rows $rows -W ([double]$win.width) -Cfg $cfg -DefTo $defSplit
+    # 这次算不出（=默认值）但上次在同一窗口算出来过 → 沿用上次的（刚点开、群名还没渲染的那一帧）
+    if ($splitTo -eq $defSplit) { $splitTo = Get-WxChatSplitMemory -WinW ([int]$win.width) -DefTo $defSplit }
+    else { Set-WxChatSplitMemory -SplitX $splitTo -WinW ([int]$win.width) -DefTo $defSplit }
+  }
+  $sxTo = $splitTo
+  $cxFrom = $splitTo
+  $script:WxSplitX = $splitTo
+  # 自校准只在"数值变了"的时候报一次（否则每张截图都刷一行）
+  if ($splitTo -ne $defSplit -and $script:WxSplitLogged -ne $splitTo) {
+    $script:WxSplitLogged = $splitTo
+    Log ("  分界线自校准：{0} → {1}（按聊天面板群名左边界收窄，避免把群名切进会话列表）" -f $defSplit, $splitTo)
+  }
 
   $sessionLines = @($rows | Where-Object { $_.x -ge $sxFrom -and $_.x -le $sxTo } | Sort-Object y)
   $chatLines = @($rows | Where-Object { $_.x -ge $cxFrom } | Sort-Object y)
@@ -317,13 +407,113 @@ function Get-ChatsFromRows($rows) {
   }
 }
 
+function Get-WxChatSplitX {
+  <#
+    .SYNOPSIS  会话列表 / 聊天面板 的横向分界线（默认取配置的 sessionXTo，必要时按实际布局往左收）
+    .DESCRIPTION
+      2026-10-29 实测（窗口 1114x807、125%）：聊天面板的群名从 x=404 起，而配置分界线是
+      0.42*1114 = 468 —— **群名前半截被切进"会话列表"**，于是：
+        · 群名 OCR 只剩尾巴「倌方）（52）」→ 校验失败、被判"不在白名单"而丢弃整条；
+        · 那个假"会话行"的 y 正好在标题栏，于是"点开会话"实际点在**标题**上（点不开）。
+      根因：会话列表在微信里是**近似固定像素宽**的，窗口拉宽后 0.42 这个比例就不成立了。
+      做法：**标题条**（窗口顶部很窄的一条，y ≤ 0.12H）里 x ≥ 0.30W 的最靠上那一簇就是聊天面板的群名，
+      用它的左边界把分界线往左收（只在 0.30W ~ 默认值之间收，避免把真正的会话行误判成聊天区）。
+      两个必须的限定（150% 实测踩过）：
+        · 只认 x ≥ 0.30W 的行 —— 否则窗口左上角的图标碎片（x≈29）会把"群名左边界"拖到 29，自校准直接失效；
+        · 只认 y ≤ 0.12H 的行 —— 否则**没开聊天时**会话行的右侧时间（x≈0.30W、y≈0.15H）会被当成群名，
+          分界线往左一收，时间列就被踢出会话列表，时间锚点全丢。
+  #>
+  param([object[]]$Rows, [double]$W, $Cfg, [int]$DefTo = 0)
+  if ($DefTo -le 0) { $DefTo = [int](Get-WxLayoutProfile -Win $script:win -Cfg $Cfg).splitX }
+  $defTo = $DefTo
+  $lo = [int]($W * 0.30)
+  $stripLimit = [int]($script:win.height * 0.12)
+  $band = @($Rows | Where-Object {
+      $_ -and $_.y -le $stripLimit -and $_.x -ge $lo -and -not [string]::IsNullOrWhiteSpace($_.text)
+    })
+  if ($band.Count -eq 0) { return $defTo }
+  $minY = [int](($band | Measure-Object -Property y -Minimum).Minimum)
+  $cluster = @($band | Where-Object { ([int]$_.y - $minY) -le 8 })
+  if ($cluster.Count -eq 0) { return $defTo }
+  # 2026-11-04：只用"像群名的行"（≥2 个字）定标题左边界。
+  #   实测：会话列表里的未读角标「O」（1 个字，x=340）与群名（x=404）同一行，
+  #   它 ≥0.30W 所以能通过上面的过滤 → 左边界被拉到 340 → 分界线收到 334 →
+  #   角标又被算进聊天区、拼进群名（标题读成「O26 人工 2 班<OCR 错字示例>（50）」）→ 校验失败漏采。
+  #   群名几乎不可能只有 1 个字，用这个条件把角标/图标碎片排除掉。
+  $nameRows = @($cluster | Where-Object { (Norm (Format-OcrText $_.text)).Length -ge 2 })
+  if ($nameRows.Count -eq 0) { return $defTo }
+  $titleMinX = [int](($nameRows | Measure-Object -Property x -Minimum).Minimum)
+  if ($titleMinX -ge $lo -and $titleMinX -lt $defTo) { return ($titleMinX - 6) }
+  return $defTo
+}
+
+# 分界线的"记忆"：点开聊天后第一张截图常常还没渲染出群名，自校准于是退回默认值（偏右）→
+#   读不到标题 → 白多点一次。同一窗口的布局不会因为一次点击就变，所以记住上次算出来的值，
+#   只在"这次算不出 + 窗口宽度没变"时沿用（窗口一变就作废，防止用户拉过窗口后拿旧值硬套）。
+function Set-WxChatSplitMemory([int]$SplitX, [int]$WinW, [int]$DefTo) {
+  if ($SplitX -ne $DefTo) {
+    $script:WxSplitMem = [pscustomobject]@{ split = $SplitX; winW = $WinW }
+  }
+}
+function Get-WxChatSplitMemory([int]$WinW, [int]$DefTo) {
+  if ($script:WxSplitMem -and $script:WxSplitMem.winW -eq $WinW) { return [int]$script:WxSplitMem.split }
+  return $DefTo
+}
+
+function Test-WxTimeLabel {
+  <#
+    .SYNOPSIS  这一行是不是"时间/日期标签"（不是群名）
+    .DESCRIPTION
+      2026-11-04 实测：点开会话后，聊天头部区最靠上的一行是时间分隔行「07：51」，
+      被 Get-ChatHeader 当成群名 → 校验必然失败（「点开的是 07:51，不是本意群」）。
+      只认"整段就是时间"的形态，避免把「周三开会」这类真群名误杀。
+  #>
+  param([string]$Text)
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
+  $s = ($Text -replace '\s', '')
+  if ($s -match '^\d{1,2}[:：]\d{2}$') { return $true }
+  if ($s -match '^(昨天|今天|前天)(\d{1,2}[:：]\d{2})?$') { return $true }
+  if ($s -match '^(星期|周)[一二三四五六日天]?(\d{1,2}[:：]\d{2})?$') { return $true }
+  if ($s -match '^\d{1,2}月\d{1,2}日(\d{1,2}[:：]\d{2})?$') { return $true }
+  return $false
+}
+
 function Get-ChatHeader($chatLines) {
   $win = $script:win
-  $limit = [int]($win.height * $cfg.headerYTo)
-  foreach ($ln in ($chatLines | Sort-Object y)) {
-    if ($ln.y -le $limit -and -not [string]::IsNullOrWhiteSpace($ln.text)) { return (Format-OcrText $ln.text) }
+  # 2026-10-29（第二轮）：标题条下沿用布局档案（比例 + 按 DPI 折算的像素下限），
+  #   窗口被拉矮时 0.16H 会小到把群名切掉，像素下限能兜住。
+  $limit = [int](Get-WxLayoutProfile -Win $win -Cfg $cfg).titleY
+  # 2026-10-29：以前是"取最靠上的那一行非空文本"。实测发现两件事：
+  #   ① 群名会被 OCR **拆成同一条 y 上的两段**（「26 示例群A 2 班 <示例群号>」+「（官方）（52）」），
+  #      只取一行就只剩尾巴 → 校验失败；
+  #   ② 头部区里还混着窗口图标之类的碎片。
+  #   改成：取"最靠上的一簇"（同一 y ±8px），按 x 排序拼起来 —— 拼出来的才是完整群名。
+  $band = @($chatLines | Where-Object {
+      $_ -and $_.y -le $limit -and -not [string]::IsNullOrWhiteSpace($_.text)
+    } | ForEach-Object {
+      [pscustomobject]@{ t = (Format-OcrText $_.text); h = [int]$_.h; x = [int]$_.x; y = [int]$_.y }
+    })
+  if ($band.Count -eq 0) { return '' }
+  # 2026-11-04：时间/日期分隔行不是群名。实测点开后头部最靠上的一行是「07：51」，
+  #   被当成标题 → 校验永远失败（「点开的是 07:51，不是本意群」），群白点一次还漏采。
+  #   头部区全是时间行时返回空 = "认不出是哪个群"，交给上层安全跳过，绝不拿时间来冒充群名。
+  $titled = @($band | Where-Object { -not (Test-WxTimeLabel $_.t) })
+  if ($titled.Count -eq 0) { return '' }
+  $minY = [int](($titled | Measure-Object -Property y -Minimum).Minimum)
+  $cluster = @($titled | Where-Object { ([int]$_.y - $minY) -le 8 })
+  if ($cluster.Count -eq 0) { return '' }
+  # 2026-11-04：同一行上，会话列表的未读角标/图标碎片（1 个字，如「O」「0」）会被拼进群名。
+  #   实测标题读成「O26 人工 2 班<OCR 错字示例>（50）」→ 与期望名不符 → 整轮白点一次还漏采。
+  #   用"≥2 个字的第一段"作为标题左锚点，只拼它右边的行（群名被拆成两段时仍能拼全）。
+  $anchorRows = @($cluster | Where-Object { (Norm $_.t).Length -ge 2 })
+  if ($anchorRows.Count -gt 0) {
+    $anchorX = [int](($anchorRows | Measure-Object -Property x -Minimum).Minimum)
+    $cluster = @($cluster | Where-Object { [int]$_.x -ge ($anchorX - 2) })
   }
-  return ''
+  $cluster = @($cluster | Sort-Object x)
+  $joined = (($cluster | ForEach-Object { $_.t }) -join '')
+  if ($joined.Length -ge 2) { return $joined }
+  return (Format-OcrText ($cluster | Select-Object -First 1).t)
 }
 
 # ---------- 会话定位 / 点击 / 读面板（2026-10-27 抽出，为了可排障、可复用） ----------
@@ -342,11 +532,46 @@ function Get-WxClickPoint {
   $nameH = if ($Row.PSObject.Properties['nameH'] -and $Row.nameH -gt 0) { [int]$Row.nameH } else { 0 }
   $ratio = if ($Cfg.PSObject.Properties['clickNameOffset']) { [double]$Cfg.clickNameOffset } else { 0.55 }
   $dy = if ($nameH -gt 0) { [int][Math]::Max(4, [Math]::Round($nameH * $ratio)) } else { [int][Math]::Round(15 * $ratio) }
+  $split = [int](Get-WxLayoutProfile -Win $Win -Cfg $Cfg).splitX
+  if ($script:WxSplitX -gt 0 -and $script:WxSplitX -lt $Win.width) { $split = [int]$script:WxSplitX }
+  $listLeft = [int]($Win.width * [double]$Cfg.sessionXFrom)
+  $clickLocalX = [int]($Win.width * [double]$Cfg.clickX)
+  if ($clickLocalX -ge ($split - 8) -or $clickLocalX -le $listLeft) { $clickLocalX = [int](($listLeft + $split) / 2) }
   return [pscustomobject]@{
-    cx = [int]($Win.left + $Win.width * [double]$Cfg.clickX)
+    cx = [int]($Win.left + $clickLocalX)
     cy = [int]($Win.top + $baseY + $dy)
     baseY = $baseY; dy = $dy; nameH = $nameH; ratio = $ratio
   }
+}
+
+function Get-WxOcclusionHint {
+  <#
+    .SYNOPSIS  「这个点现在被谁盖住了」的可读说明（只用于排障日志，不参与任何判定）
+    .DESCRIPTION
+      2026-10-29：外部复测里"一个群都点不开"最容易被忽略的一种原因是**窗口被别的程序盖住** ——
+      PrintWindow 在窗口被遮挡时可能返回旧帧，于是"点开了没有"这个判断本身就失真
+      （日志里同时出现「内容变化=False」和「校验=False」）。
+      以前日志只写"最顶层窗口不是微信"，用户不知道下一步该做什么；现在把标题也打出来。
+  #>
+  param(
+    [Parameter(Mandatory = $true)][int]$X,
+    [Parameter(Mandatory = $true)][int]$Y,
+    [IntPtr]$Expect = [IntPtr]::Zero
+  )
+  try {
+    $top = [WxNative]::TopAt($X, $Y)
+    $title = ''
+    try {
+      $sb = New-Object System.Text.StringBuilder 256
+      [void][WxNative]::GetWindowTextW($top, $sb, 256)
+      $title = $sb.ToString()
+    } catch { }
+    return [pscustomobject]@{
+      hwnd    = $top
+      title   = $title
+      covered = ($Expect -ne [IntPtr]::Zero -and $top -ne $Expect)
+    }
+  } catch { return $null }
 }
 
 function Find-WxChatTarget {
@@ -378,8 +603,10 @@ function Read-WxChatPane {
     [Parameter(Mandatory = $true)]$Win,
     [Parameter(Mandatory = $true)][string]$Shot,
     [Parameter(Mandatory = $true)][int]$Scale,
-    [int]$Tries = 3,
-    [int]$GapMs = 700
+    # 2026-10-29：3 次 × 700ms 在 150% 实测不够 —— 大群（50 人、历史长）点开后 2 秒还没渲染完，
+    #   抓到的是"旧帧/空面板"。放宽到 4 次 × 900ms；读到就 break，所以正常情况下不会变慢。
+    [int]$Tries = 4,
+    [int]$GapMs = 900
   )
   $best = $null
   for ($i = 0; $i -lt $Tries; $i++) {
@@ -393,10 +620,58 @@ function Read-WxChatPane {
     } catch {
       $parsed = $null; $hdr = ''; $cnt = 0
     }
-    $best = [pscustomobject]@{ header = $hdr; parsed = $parsed; bodyCount = $cnt; tries = ($i + 1) }
+    # ⚠️ 2026-10-29：以前这里是无条件覆盖 —— 于是"第 1 帧读到了标题、第 2/3 帧渲染反而空"时，
+    #   返回的是**最后一帧**（空标题），校验直接判失败、还白多点一次（150% 实测就是这么发生的）。
+    #   改成保留"最好的一帧"：有标题优先，其次正文行数多的。
+    $hdrBonus = 0
+    if (-not [string]::IsNullOrWhiteSpace($hdr)) { $hdrBonus = 1000 }
+    $score = $hdrBonus + [Math]::Min($cnt, 500)
+    if ($null -eq $best -or $score -ge $best.score) {
+      $best = [pscustomobject]@{ header = $hdr; parsed = $parsed; bodyCount = $cnt; tries = ($i + 1); score = $score }
+    }
     if (-not [string]::IsNullOrWhiteSpace($hdr) -and $cnt -ge 2) { break }
   }
-  if ($null -eq $best) { $best = [pscustomobject]@{ header = ''; parsed = $null; bodyCount = 0; tries = 0 } }
+  # 2026-10-29（第二轮）：整帧空白 = 十有八九抓到的是"点开前那一帧"（窗口还没重绘完）。
+  #   实测证据：采集器 3×700ms 判"点不开"，紧接着手工截图同一个群却标题清晰、正文完整 ——
+  #   差的就是时间。这种时候再多快轮询都没用，补一次长等待（2s）再读一帧。
+  if (($null -eq $best) -or ([string]::IsNullOrWhiteSpace($best.header) -and [int]$best.bodyCount -eq 0)) {
+    Start-Sleep -Milliseconds 2000
+    try {
+      $null = Save-WxWindowShot -Hwnd $Win.hwnd -Path $Shot -Scale $Scale
+      $rows = @(Invoke-WxOcr -Path $Shot -Scale $Scale)
+      $parsed = Get-ChatsFromRows $rows
+      $hdr = Get-ChatHeader $parsed.chatLines
+      $cnt = @($parsed.chatLines | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+      $hdrBonus = 0
+      if (-not [string]::IsNullOrWhiteSpace($hdr)) { $hdrBonus = 1000 }
+      $score = $hdrBonus + [Math]::Min($cnt, 500)
+      if (($null -eq $best) -or $score -ge $best.score) {
+        $best = [pscustomobject]@{ header = $hdr; parsed = $parsed; bodyCount = $cnt; tries = ($Tries + 1); score = $score }
+      }
+      if ($score -gt 0) { Log '  整帧空白 → 长等待 2s 后重读，读到了' }
+    } catch { }
+  }
+  if ($null -eq $best) { $best = [pscustomobject]@{ header = ''; parsed = $null; bodyCount = 0; tries = 0; score = 0 } }
+  # 2026-10-29：标题读不到时，把"头部区实际认出了什么"打出来 —— 否则只能看到"标题仍为空"，
+  #   没法判断是没渲染、还是被分界线切掉了、还是 OCR 读成碎片（150% 实测就吃过这个亏）。
+  if ([string]::IsNullOrWhiteSpace($best.header) -and $best.parsed) {
+    $limit = [int](Get-WxLayoutProfile -Win $Win -Cfg $cfg).titleY
+    $band = @($best.parsed.chatLines | Where-Object { $_ -and $_.y -le $limit } | Sort-Object y, x |
+        Select-Object -First 4 | ForEach-Object {
+          'y={0} x={1} 「{2}」' -f $_.y, $_.x, (Format-OcrText $_.text)
+        })
+    if ($band.Count -eq 0) {
+      # 再补一句"整帧到底有没有认出行"——区分「这一帧 OCR 全空（没渲染/抓到旧帧）」和「行有，但被 x/y 过滤掉了」
+      $allRows = @($best.parsed.chatLines)
+      $topAny = @($allRows | Sort-Object y, x | Select-Object -First 3 | ForEach-Object {
+          'y={0} x={1} 「{2}」' -f $_.y, $_.x, (Format-OcrText $_.text)
+        })
+      $hint = if ($allRows.Count -eq 0) { '整帧聊天区一行都没有（多半还没渲染）' } else { ('聊天区共 {0} 行，最靠上的是 {1}' -f $allRows.Count, ($topAny -join ' / ')) }
+      Log ('  标题读不到：头部区（y≤{0}、x≥{1}）一行都没认出来；{2}' -f $limit, $script:WxSplitX, $hint)
+    } else {
+      Log ('  标题读不到：头部区（y≤{0}、x≥{1}）最靠上的行 = {2}' -f $limit, $script:WxSplitX, ($band -join ' / '))
+    }
+  }
   return $best
 }
 
@@ -475,10 +750,29 @@ function Select-MentionLines($lines) {
   return $out
 }
 
+# 判断窗口是否处于"抓不到内容"的状态，并给出**原因**（2026-10-29 抽出）。
+# 为什么抽出来：以前是内联的 `width -lt 400 -or height -lt 300`。这个阈值在
+#   125%/150% 缩放 + 微信开成窄窗口时会把**正常窗口**判成"不可见"
+#   （实测本机：物理 368x484 的真实微信窗口 → 每轮静默跳过、一条都不采）。
+#   现在尺寸只用来挡真正的折叠/隐藏态（实测那种是 159x27）。
+function Test-WxWindowCollapsed {
+  param($Info)
+  if ($null -eq $Info) { return '取不到窗口' }
+  if ($Info.minimized) { return '窗口已最小化' }
+  if (-not $Info.visible) { return '窗口被隐藏（收进托盘）' }
+  if ($Info.left -lt -10000 -or $Info.top -lt -10000) { return ('窗口在屏幕外 ({0},{1})' -f $Info.left, $Info.top) }
+  if ($Info.width -lt 200 -or $Info.height -lt 160) { return ('窗口尺寸过小 {0}x{1}（折叠/隐藏态）' -f $Info.width, $Info.height) }
+  return ''
+}
+
 # ================= 主流程 =================
 function Invoke-Pass([int]$index) {
+  # 上轮若恢复曾失败，先重试清理；不能静默清空待恢复状态。
+  if ($null -ne $script:WxPseudoState -or $null -ne $script:WxRestoreAfterPass) { Clear-WxPseudoState }
   # R1（2026-10-27）：记录本轮命令执行时间，整轮只取一次（时间锚点的基准）。
   $script:PassNow = Get-Date
+  $script:WxStatusKind = 'complete'
+  $script:skipNote = ''
   Log ('本轮执行时间 {0:yyyy-MM-dd HH:mm:ss}（相对时间以它为准）' -f $script:PassNow)
   $offline = -not [string]::IsNullOrWhiteSpace($OcrRows)
   if ($offline) {
@@ -487,14 +781,26 @@ function Invoke-Pass([int]$index) {
   } else {
     $info = Get-WxWindowInfo
   }
-  if ($null -eq $info) { Log '找不到微信主窗口（微信没开或窗口标题不含"微信"）'; $script:skipNote = '微信未运行，本轮跳过（无窗口可采）'; return 0 }
+  if ($null -eq $info) { Log '跳过：微信未运行（无窗口可采，或窗口标题不含“微信”）'; $script:WxStatusKind = 'env-skip'; $script:skipNote = '环境跳过：微信未运行（无窗口可采）'; return 0 }
+  if (-not $offline -and $script:WxPassForeground -eq [IntPtr]::Zero) { $script:WxPassForeground = Get-WxForeground }
+  $script:WxPassHwnd = $info.hwnd
   $script:win = $info
-  Log ("窗口 {0}x{1} @ ({2},{3}) hwnd=0x{4}" -f $info.width, $info.height, $info.left, $info.top, $info.hwnd.ToInt64().ToString('X'))
+  # 2026-10-29：坐标空间自证 —— 125%/150% 缩放下，如果这里报的是"虚拟值"，后面
+  #   会话列裁剪边界、标题区、点击落点全都会按错的尺度算（外部复测的"一个群都点不开"就是这个）。
+  #   这一行是排障第一眼：物理像素 = 屏幕上量的实际尺寸。
+  $dpiNote = ''
+  if ($info.PSObject.Properties['dpi']) {
+    if ($info.dpiAware) { $dpiNote = ('（DPI {0}；坐标空间=物理像素，已声明 DPI 感知）' -f $info.dpi) }
+    elseif ($info.dpiFixed) { $dpiNote = ('（DPI {0}；坐标空间=物理像素，按窗口 DPI ×{1:N2} 校正）' -f $info.dpi, $info.dpiFactor) }
+    else { $dpiNote = ('（DPI {0}；⚠️ 坐标可能是虚拟像素 —— 若缩放不是 100% 会点歪）' -f $info.dpi) }
+  }
+  Log ("窗口 {0}x{1} @ ({2},{3}) hwnd=0x{4}{5}" -f $info.width, $info.height, $info.left, $info.top, $info.hwnd.ToInt64().ToString('X'), $dpiNote)
 
   # 窗口被最小化/收到托盘时：它不参与 DWM 合成，直接抓必然为空。
   # 两条路：① 只读采集 → 伪最小化（显示但不激活 + 近乎透明 + 点击穿透，用户看不见，PrintWindow 仍能抓）
   #         ② 需要点击（AllowClick）→ 只能真正恢复窗口可见
-  $hidden = (-not $offline) -and (($info.minimized) -or (-not $info.visible) -or ($info.left -lt -10000) -or ($info.top -lt -10000) -or ($info.width -lt 400) -or ($info.height -lt 300))
+  $collapseWhy = if ($offline) { '' } else { Test-WxWindowCollapsed -Info $info }
+  $hidden = -not [string]::IsNullOrEmpty($collapseWhy)
   $wasHidden = (-not $info.visible)                      # 收托盘（SW_HIDE）；还原时不要给用户留成"最小化"
   $restoreState = if ($wasHidden) { 'hide' } elseif ($info.minimized) { 'minimize' } else { 'none' }
   $wasMinimized = $hidden
@@ -504,26 +810,41 @@ function Invoke-Pass([int]$index) {
       # 伪最小化后台抓图（MaaFramework 的 pseudo-minimize 思路）。
       # 2026-10-14 17:45 真实端到端验证通过：微信最小化态（159x27 @ -25600,-25600）和收托盘态（可见=False）
       # 都能抓到画面并正确解析出会话列表；计划任务一直带 -Pseudo。
-      Log '微信窗口不可见 → 伪最小化后台抓图（不打扰，读完还原）'
-      $pseudoOldEx = Enter-WxPseudoMinimize -Hwnd $info.hwnd
-      Start-Sleep -Milliseconds 1800
-      $info = Get-WxWindowInfo
-      $hidden = ($null -eq $info) -or ($info.left -lt -10000) -or ($info.top -lt -10000) -or ($info.width -lt 400) -or ($info.height -lt 300)
+      Log ('微信窗口不可用（{0}）→ 伪最小化后台抓图（不打扰，读完还原）' -f $collapseWhy)
+      $pseudoEntry = Enter-WxPseudoMinimize -Hwnd $info.hwnd -RestoreState $restoreState
+      $pseudoOldEx = [int]$pseudoEntry.oldExStyle
+      $script:WxPseudoState = [pscustomobject]@{ hwnd = $info.hwnd; oldExStyle = $pseudoOldEx; restoreState = [string]$pseudoEntry.restoreState; hadLayerAttrs = [bool]$pseudoEntry.hadLayerAttrs; oldColorKey = [uint32]$pseudoEntry.oldColorKey; oldAlpha = [byte]$pseudoEntry.oldAlpha; oldLayerFlags = [uint32]$pseudoEntry.oldLayerFlags }
+      try {
+        Start-Sleep -Milliseconds 1800
+        $info = Get-WxWindowInfo
+        $collapseWhy = Test-WxWindowCollapsed -Info $info
+        $hidden = -not [string]::IsNullOrEmpty($collapseWhy)
+      } catch {
+        Clear-WxPseudoState
+        $pseudoOldEx = $null
+        throw
+      }
       if ($hidden -and $pseudoOldEx -ne $null) {
-        [void](Exit-WxPseudoMinimize -Hwnd $info.hwnd -OldExStyle $pseudoOldEx -RestoreState $restoreState)
+        Clear-WxPseudoState
         $pseudoOldEx = $null
       }
     } else {
-      Log '微信窗口不可见 → 恢复窗口再采集（restoreIfMinimized=true）'
+      Log ('微信窗口不可用（{0}）→ 恢复窗口再采集（restoreIfMinimized=true）' -f $collapseWhy)
+      $script:WxRestoreAfterPass = [pscustomobject]@{ hwnd = $info.hwnd; restoreState = $restoreState; minimized = [bool]$info.minimized; visible = [bool]$info.visible }
       [void](Restore-WxWindow -Hwnd $info.hwnd)
       Start-Sleep -Milliseconds 1800
       $info = Get-WxWindowInfo
-      $hidden = ($null -eq $info) -or ($info.minimized) -or ($info.left -lt -10000) -or ($info.top -lt -10000) -or ($info.width -lt 400) -or ($info.height -lt 300)
+      $collapseWhy = Test-WxWindowCollapsed -Info $info
+      $hidden = -not [string]::IsNullOrEmpty($collapseWhy)
+      if ($hidden) { Clear-WxPseudoState }
     }
   }
   if ($hidden) {
-    if ($pseudoOldEx -ne $null) { [void](Exit-WxPseudoMinimize -Hwnd $info.hwnd -OldExStyle $pseudoOldEx -RestoreState $restoreState) }
-    Log ("跳过：微信窗口当前不可见（min={0} rect=({1},{2}) {3}x{4}）——最小化/收进托盘了，本轮不采集" -f $info.minimized, $info.left, $info.top, $info.width, $info.height)
+    if ($pseudoOldEx -ne $null) { Clear-WxPseudoState }
+    $skipText = "微信窗口不可用（{0}；rect=({1},{2}) {3}x{4}）" -f $collapseWhy, $info.left, $info.top, $info.width, $info.height
+    Log ("跳过：{0} —— 本轮不采集" -f $skipText)
+    $script:WxStatusKind = 'env-skip'
+    $script:skipNote = '环境跳过：' + $skipText
     return 0
   }
   if ($wasMinimized) { Log ("恢复后窗口 {0}x{1} @ ({2},{3})（伪最小化={4}）" -f $info.width, $info.height, $info.left, $info.top, ($pseudoOldEx -ne $null)) }
@@ -533,6 +854,31 @@ function Invoke-Pass([int]$index) {
   # 如果在恢复前就赋值，会话列范围会被算成 [15,66]，正好把 x≈156 的群名全部排除 →
   # 实测症状：24 行 OCR 但"会话列表识别到 0 个会话"（这就是交接文档里"伪最小化坐标空间不同、待标定"的真因）。
   $script:win = $info
+
+  # 2026-11-06：会话列表被滚离顶部时，"视野外的群"等于不存在（不点、不采）。
+  #   窗口可见时先把它滚回顶部再识别；伪最小化态窗口带 WS_EX_TRANSPARENT（点击穿透），
+  #   真实滚轮会被下发到后面的窗口，所以那种情况只记一笔、不硬滚。
+  if (-not $offline -and -not ($env:WX_LIST_RESET -eq '0')) {
+    if ($pseudoOldEx -ne $null) {
+      Log '  [列表] 伪最小化状态下无法滚动会话列表（输入穿透）→ 跳过归位'
+    } else {
+      try {
+        $reset = Invoke-WxChatListReset -Win $info -AutoFocus
+        if ($reset.method -eq 'signature') {
+          # 几何判据判不出来（可读行太少）时走签名法：滚到文本不再变化即到顶
+          Log ("  [列表] 行数不足，改用签名法归位（向上滚 {0} 档，已到顶）" -f $reset.notches)
+        } elseif ($reset.clippedBefore) {
+          if ($reset.clippedAfter) {
+            Log ("  [列表] 会话列表滚离顶部（{0}）→ 已向上滚 {1} 档仍未到顶，下一个可见群可能仍被切" -f $reset.before.reason, $reset.notches)
+          } else {
+            Log ("  [列表] 会话列表滚离顶部（{0}）→ 已滚回顶部（{1} 档）" -f $reset.before.reason, $reset.notches)
+          }
+        }
+      } catch {
+        Log ('  [列表] 归位失败（{0}）→ 本轮仍按当前可见列表采集' -f $_.Exception.Message)
+      }
+    }
+  }
 
   $shot = Join-Path $shotDir 'latest.png'
   # 离线钩子：-OcrRows 给一份 fixture（{width,height,rows:[{x,y,text,h}]}）就跳过抓图/OCR，
@@ -548,8 +894,10 @@ function Invoke-Pass([int]$index) {
     $shotInfo = Save-WxWindowShot -Hwnd $info.hwnd -Path $shot -Scale $ocrScale
     $rows = Invoke-WxOcr -Path $shot -Scale $ocrScale
     $fxOut = [ordered]@{ width = $info.width; height = $info.height; hwnd = $info.hwnd.ToInt64(); rows = @($rows | ForEach-Object { [ordered]@{ x = $_.x; y = $_.y; text = $_.text; h = $_.h } }) }
-    ($fxOut | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $DumpRowsJson -Encoding UTF8
+    $fxJson = $fxOut | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($DumpRowsJson, $fxJson, (New-Object System.Text.UTF8Encoding($false)))
     Log ("已导出 OCR fixture → " + $DumpRowsJson + "（" + $rows.Count + " 行）")
+    Clear-WxPseudoState
     return 0
   } else {
     $shotInfo = Save-WxWindowShot -Hwnd $info.hwnd -Path $shot -Scale $ocrScale
@@ -580,6 +928,7 @@ function Invoke-Pass([int]$index) {
       Log ("   @{0}   x{1}" -f $_.Key, $_.Value)
     }
     Log '把"我"的昵称填进 config.json 的 myAliases，把要盯的群填进 groupWhitelist'
+    Clear-WxPseudoState
     return 0
   }
 
@@ -679,10 +1028,21 @@ function Invoke-Pass([int]$index) {
       $script:WxBgClickFx = [double]$s.w / [double]$WinW
       $script:WxBgClickFy = [double]$s.h / [double]$WinH
       $script:WxBgClickReady = $true
+      $script:WxBgClickLastTitle = ''
+      $script:WxBgClickLastResult = $null
       # ⚠️ 2026-10-27：点击坐标**不再**乘下面这个"图像/窗口"比例（见 Invoke-WxClickSmart 里的注释：
       #   Maa 的 PostClick 吃客户区坐标；乘了比例会随 y 增大而越点越偏，正是老问题"点开的是别的群"的真因）。
-      #   这两个值保留在日志里，用来核对抓图与窗口的尺寸关系。
-      Log ("  后台点击就绪：输入法 {0}｜Maa 图像 {1}x{2}｜窗口 {3}x{4}（图像/窗口 {5:N4}/{6:N4}；点击按客户区坐标发）" -f $im, $s.w, $s.h, $WinW, $WinH, $script:WxBgClickFx, $script:WxBgClickFy)
+      # 2026-10-29：这段结论成立的**前提是"抓图尺寸与窗口是同一套像素"**（即两者都是物理像素）。
+      #   比例本身不是错误信号 —— Maa 的抓图分辨率本来就可能比窗口大（本机 100% 下 1100/894 = 1.23）；
+      #   真正会点歪的是"窗口矩形是虚拟坐标"（非 100% 缩放 + 没声明 DPI 感知）。
+      #   所以下面判的是**坐标空间**，不是比例数字。
+      $spaceNote = if ($script:WxDpiAware) { '坐标空间=物理像素（DPI 感知）' }
+                   elseif ($script:win.PSObject.Properties['dpiFixed'] -and $script:win.dpiFixed) { ('坐标空间=物理像素（按 DPI ×{0:N2} 校正）' -f $script:win.dpiFactor) }
+                   else { '⚠️ 坐标可能是虚拟像素' }
+      Log ("  后台点击就绪：输入法 {0}｜Maa 图像 {1}x{2}｜窗口 {3}x{4}（图像/窗口 {5:N4}/{6:N4}；{7}；点击按客户区坐标发）" -f $im, $s.w, $s.h, $WinW, $WinH, $script:WxBgClickFx, $script:WxBgClickFy, $spaceNote)
+      if (-not $script:WxDpiAware -and -not ($script:win.PSObject.Properties['dpiFixed'] -and $script:win.dpiFixed)) {
+        Log ('  [警告] 本进程未声明 DPI 感知（{0}）且没取到窗口 DPI：若系统缩放不是 100%，点击/裁剪都会偏。' -f $script:WxDpiNote)
+      }
       return $true
     } catch {
       Log ('  后台点击初始化异常：{0} → 退回真实鼠标' -f $_.Exception.Message)
@@ -693,7 +1053,12 @@ function Invoke-Pass([int]$index) {
   function Invoke-WxClickSmart {
     param([IntPtr]$Hwnd, [int]$ScreenX, [int]$ScreenY, [int]$WinLeft, [int]$WinTop)
     if (-not $script:WxBgClickReady) {
-      Invoke-WxClickAt -X $ScreenX -Y $ScreenY
+      try {
+        $clicked = Invoke-TargetWindowClick -Hwnd $Hwnd -X $ScreenX -Y $ScreenY -SettleMs 40
+      } catch {
+        Log ('  真实点击取消：' + $_.Exception.Message); return $false
+      }
+      if (-not $clicked) { Log '  真实点击取消：目标失焦、被遮挡或鼠标被接管'; return $false }
       return $true
     }
     # 2026-10-27 修（真机定位到的"点串行"根因）：坐标**不要**再乘"抓图/窗口比例"。
@@ -713,18 +1078,22 @@ function Invoke-Pass([int]$index) {
       if ($fg0 -ne [IntPtr]::Zero) { try { [void][WxNative]::SetForegroundWindow($fg0) } catch { } }
       Log ("  [注意] 后台点击引起前台变化（0x{0:X} → 0x{1:X}），已尝试还原" -f [int64]$fg0, [int64]$fg1)
     }
-    return $ok
+    if (-not $ok) { Log '  后台点击返回失败'; return $false }
+    return $true
   }
 
   if ($changed.Count -gt 0 -and $AllowClick) {
-    # 先试着起后台点击。成功的话下面就不必退出伪最小化、也不必把微信提到前台。
-    $bgOk = Initialize-WxBgClick -Hwnd $info.hwnd -WinW $info.width -WinH $info.height
-    # 伪最小化是"点击穿透"的，要做**真实鼠标**点击必须先退出伪最小化、让窗口真正可见可点。
-    # 后台点击（PostMessage）不需要窗口可见 → 保持伪最小化，用户完全看不到微信被翻出来。
+    # 本机真实实测 Maa 返回成功但打开了错误会话，因此微信端先禁用后台点击。
+    # 仅在可见、未最小化且点击点确实归属微信时，才走受保护的真实鼠标路径。
+    $bgOk = $false
+    $script:WxBgClickReady = $false
+    $script:WxBgClickCtrl = [IntPtr]::Zero
+    # 真实鼠标点击必须先退出伪最小化、恢复窗口可见并让目标点受微信拥有；失焦/被遮挡则安全放弃。
     if (-not $bgOk -and $pseudoOldEx -ne $null) {
       Log '有会话需要点开读取 → 退出伪最小化，临时恢复窗口（读完会再收回去）'
-      [void](Exit-WxPseudoMinimize -Hwnd $info.hwnd -OldExStyle $pseudoOldEx -RestoreState $restoreState)
+      Clear-WxPseudoState
       $pseudoOldEx = $null
+      $script:WxRestoreAfterPass = [pscustomobject]@{ hwnd = $info.hwnd; restoreState = $restoreState; minimized = [bool]$info.minimized; visible = [bool]$info.visible }
       [void](Restore-WxWindow -Hwnd $info.hwnd)
       Start-Sleep -Milliseconds 1200
     }
@@ -747,21 +1116,41 @@ function Invoke-Pass([int]$index) {
       #   所以重试是安全的；最多 2 次，仍不对就走后面的兜底 + 白名单闸门（绝不写越界记录）。
       $pane = $null; $target = $null; $header = ''; $headerRead = $false; $verified = $false
       $shot2 = Join-Path $shotDir ('chat-{0}.png' -f ([DateTime]::Now.ToString('HHmmss')))
-      for ($attempt = 1; $attempt -le 2; $attempt++) {
+      # 2026-10-29（第二轮）失败自搜索：第 3 次尝试时换一个候选分界线。
+      #   为什么需要：布局一变（拉窗口/换缩放/换微信版本），分界线就可能切进聊天面板，
+      #   表现就是"点了但标题读不到/点开的不是本意群"。这时与其等人来改配置，
+      #   不如自己换个分界线再试一次 —— 候选来自 Get-WxSplitCandidates（内容自锚定 → 档案/比例 → ±10%/20%）。
+      $script:WxSplitOverride = 0
+      $script:WxSplitCandidates = @(Get-WxSplitCandidates -Win $info -Cfg $cfg -ContentSplit ([int]$script:WxSplitX))
+      $script:WxSplitTry = 0
+      for ($attempt = 1; $attempt -le 3; $attempt++) {
+        if ($attempt -eq 3) {
+          $script:WxSplitTry++
+          if ($script:WxSplitTry -lt $script:WxSplitCandidates.Count) {
+            $script:WxSplitOverride = [int]$script:WxSplitCandidates[$script:WxSplitTry]
+            Log ("  两次都没校验通过 → 换分界线重试（候选 {0}，当前 {1}）" -f $script:WxSplitTry, $script:WxSplitOverride)
+          } else {
+            $script:WxSplitOverride = 0
+            Log '  候选分界线都试完了 → 不再重试，走兜底记录'
+            break
+          }
+        }
         # 列表稳定化（2026-10-27）：新消息会让列表在"截图 → OCR(约 1s) → 点击"这段时间里重排，
         #   实测点「26 示例群A 2 班」却打开「示例群G」就是这种"一行之差的换位"（真机复现两次）。
         #   做法：连拍两张，**列表签名（每个会话名）一致才点**；不一致就再拍（最多 3 轮）。
-        $fresh = @(); $sigPrev = $null; $shotsTaken = 0
+        $fresh = @(); $sigPrev = $null; $shotsTaken = 0; $listStable = $false
+        $info = Get-WxWindowInfo -Hwnd $info.hwnd
+        $script:win = $info
         for ($st = 0; $st -lt 3; $st++) {
           $null = Save-WxWindowShot -Hwnd $info.hwnd -Path $shot -Scale $ocrScale
           $fresh = @((Get-ChatsFromRows (Invoke-WxOcr -Path $shot -Scale $ocrScale)).chats)
-          $sig = (@($fresh | ForEach-Object { (Norm $_.name) }) -join '|')
+          $sig = (@($fresh | ForEach-Object { '{0}@{1}' -f (Norm $_.name), [int]$_.nameY }) -join '|')
           $shotsTaken = $st + 1
-          if ($null -ne $sigPrev -and $sig -eq $sigPrev) { break }
+          if ($null -ne $sigPrev -and $sig -eq $sigPrev) { $listStable = $true; break }
           $sigPrev = $sig
           if ($st -lt 2) { Start-Sleep -Milliseconds 200 }
         }
-        if ($shotsTaken -gt 2) { Log ("  列表一直在变（连拍 {0} 张才稳定）→ 以最后一张为准" -f $shotsTaken) }
+        if (-not $listStable) { Log '  名字或行位置仍在变化，本次不点击'; $target = $null; continue }
         # 排障：把"点击前这一眼看到的列表"（名字@nameY）打出来。点歪时能直接看出
         #   ① 是不是名字认错了行的位置 ② 是不是 OCR 把两行并了 ③ 点的是不是这张图里的行。
         if ($DumpRows) { Log ('  [点击前列表] ' + ((@($fresh | ForEach-Object { ('{0}@{1}' -f [string]$_.name, [int]$_.nameY) })) -join ' | ')) }
@@ -778,30 +1167,67 @@ function Invoke-Pass([int]$index) {
 
         # 2026-10-27：点击坐标/偏移统一由 Get-WxClickPoint 算（日志里拆开展示）。
         $pt = Get-WxClickPoint -Win $info -Row $target -Cfg $cfg
+        # 2026-11-06：点击前「整行复读」确认 —— 防 OCR 认错行导致点开错误的群。
+        #   整窗 OCR 会把相邻两行并成一行、把「212」读成「21」；一旦落到错行就打开了别的会话。
+        #   这里把候选行的名字区裁出来、放大两档各读一遍，两档都认出本群才允许点击；
+        #   任一档读不出/读成别的名字就跳过（下一轮还能补），绝不冒险点击。
+        #   临时关闭：WX_ROW_CONFIRM=0，或 config.json 里 rowConfirm=false。
+        $rowConfirmOn = -not ($null -ne $env:WX_ROW_CONFIRM -and $env:WX_ROW_CONFIRM -eq '0')
+        if ($cfg.PSObject.Properties['rowConfirm'] -and $cfg.rowConfirm -eq $false) { $rowConfirmOn = $false }
+        if ($rowConfirmOn) {
+          # 裁剪右边界用「列表/聊天分界线 - 边距」，而不是 sessionXTo 比例：
+          #   分界线常比比例值靠左，直接用比例会把聊天正文裁进来，复读结果被污染。
+          $splitForCrop = [int](Get-WxLayoutProfile -Win $info -Cfg $cfg).splitX
+          if ($script:WxSplitX -gt 0 -and $script:WxSplitX -lt $info.width) { $splitForCrop = [int]$script:WxSplitX }
+          $cropRight = [int][Math]::Min($splitForCrop - 6, [int][Math]::Ceiling($info.width * 0.37))
+          $conf = Test-WxRowConfirmation -Win $info -Row $target -Expected $c.name `
+            -XFrom ([double]$cfg.sessionXFrom) -XToPx $cropRight
+          if (-not $conf.ok) {
+            $seen = (@($conf.passes | ForEach-Object { if ([string]::IsNullOrWhiteSpace($_)) { '（空）' } else { $_ } }) -join ' ‖ ')
+            $rc = $conf.rect
+            Log ("跳过「{0}」：点击前整行复读未通过（{1}）；裁剪=({2},{3},{4}x{5}) 预期=「{6}」两档识别=「{7}」→ 为避免点开错误会话已放弃" -f `
+                $c.name, $conf.reason, $rc.x, $rc.y, $rc.w, $rc.h, $c.name, $seen)
+            $target = $null
+            break
+          }
+          Log ("  点击前确认「{0}」：{1}" -f $c.name, ($conf.passes -join ' / '))
+        }
         # 安全锁：真实鼠标点击时，坐标处最顶层的窗口必须是微信（否则会把点击送到别的程序上）。
         # 后台点击是发窗口消息、不经过屏幕，被遮挡也能点 → 这时不需要（也不该）做这个检查，
         # 否则"微信被别的窗口盖住"就无法采集了，而那正是后台模式要解决的场景。
         if (-not $bgOk) {
           $topAt = [WxNative]::TopAt($pt.cx, $pt.cy)
-          if ($topAt -ne $info.hwnd) {
-            Log ("跳过「{0}」：({1},{2}) 处最顶层窗口是 0x{3}，不是微信 → 为避免误点已放弃" -f $target.name, $pt.cx, $pt.cy, $topAt.ToInt64().ToString('X'))
+          if (-not [WxNative]::SameRootWindow($topAt, $info.hwnd) -or -not [WxNative]::ForegroundMatches($info.hwnd)) {
+            $occ = Get-WxOcclusionHint -X $pt.cx -Y $pt.cy -Expect $info.hwnd
+            $occName = if ($occ) { ('0x{0}「{1}」' -f $occ.hwnd.ToInt64().ToString('X'), $occ.title) } else { '别的窗口' }
+            Log ("跳过「{0}」：({1},{2}) 处最顶层窗口是 {3}，不是微信 → 为避免误点已放弃" -f $target.name, $pt.cx, $pt.cy, $occName)
+            Log '        可操作办法：① 把微信窗口移到不被遮挡的位置；② 或让后台点击可用（它发窗口消息、不经过屏幕）；③ 或确认坐标空间是物理像素（上面"窗口 …"那行）'
             $target = $null
             break
           }
         }
         Log ("点击会话「{0}」{1} @ 屏幕({2},{3})（窗口内 y={4} = 名字行 {5} + 偏移 {6}［字高 {7}×{8}］）{9}" -f `
             $target.name, $(if ($attempt -gt 1) { '（第 2 次尝试）' } else { '' }), $pt.cx, $pt.cy, ($pt.cy - $info.top), $pt.baseY, $pt.dy, $pt.nameH, $pt.ratio, $(if ($bgOk) { '（后台）' } else { '' }))
-        [void](Invoke-WxClickSmart -Hwnd $info.hwnd -ScreenX $pt.cx -ScreenY $pt.cy -WinLeft $info.left -WinTop $info.top)
+        $nowRect = Get-WxWindowInfo -Hwnd $info.hwnd
+        if ($nowRect.left -ne $info.left -or $nowRect.top -ne $info.top -or $nowRect.width -ne $info.width -or $nowRect.height -ne $info.height) {
+          Log '  截图后窗口位置或尺寸变化，放弃旧坐标并重新定位'; continue
+        }
+        if (-not (Invoke-WxClickSmart -Hwnd $info.hwnd -ScreenX $pt.cx -ScreenY $pt.cy -WinLeft $info.left -WinTop $info.top)) {
+          Log '  点击未成功，不读取旧聊天面板'; continue
+        }
         Start-Sleep -Milliseconds $cfg.clickSettleMs
 
-        # 读面板：轮询等渲染（最多 3 次 ×700ms）
-        $pane = Read-WxChatPane -Win $info -Shot $shot2 -Scale $ocrScale -Tries 3 -GapMs 700
+        # 读面板：轮询等渲染。2026-10-29（第二轮）实测：点开后窗口内容要**好几秒**才真正重绘完，
+        #   3×700ms=2.1s 经常只拿到"点开前那一帧"（聊天区一行都没有）→ 误判"点不开"。
+        #   标定时（点击后约 10s 再截图）同一个群明明已经打开且标题清晰，说明是等待不够，不是坐标错。
+        #   这里放宽到 5×1000ms=5s；Read-WxChatPane 内部对"整帧空白"还会再补一次长等待。
+        $pane = Read-WxChatPane -Win $info -Shot $shot2 -Scale $ocrScale -Tries 5 -GapMs 1000
         if ($null -eq $pane.parsed) { continue }
         $header = [string]$pane.header
         $headerRead = -not [string]::IsNullOrWhiteSpace($header)
-        # 2026-10-27：verified 改用容错判定（同名 / 同一白名单群 / 编辑距离≤1），
-        #   别再因为 OCR 错一两个字就把"同一个群"判成"点开了别的群"。
-        $verified = if ($headerRead) { (Get-ChatMatchInfo -A $header -B $c.name -Whitelist $wlList).same } else { $false }
+        # 列表候选允许宽松 OCR 匹配；最终标题身份确认必须更严格，不能用共享短白名单词合并不同群。
+        $identity = if ($headerRead) { Get-ChatFinalIdentityInfo -Actual $header -Expected ([string]$c.name) } else { [pscustomobject]@{ same = $false; why = '标题为空' } }
+        $verified = [bool]$identity.same
         if ($verified) { break }
         if ($attempt -lt 2) {
           if ($headerRead) { Log ("  点开的是「{0}」，不是本意群 → 重新定位再点一次" -f $header) }
@@ -809,22 +1235,36 @@ function Invoke-Pass([int]$index) {
           Start-Sleep -Milliseconds 400
         }
       }
+      $script:WxSplitOverride = 0     # 自搜索只作用于这一个会话，别影响后面的
       if ($null -eq $target -or $null -eq $pane -or $null -eq $pane.parsed) {
-        # 两次都没打开/没读到画面：至少把列表里的预览记下来（与"正文太短"那条兜底同一策略），别让这次变化白丢
-        $rec = [ordered]@{
-          kind = 'preview'; ts = (Get-Date).ToString('o'); source = 'wechat-screenshot-ocr'
-          chat = $c.name; preview = $c.preview
-          note = '点开两次都没读到聊天面板，退回记录列表预览'
+        # 点开失败时绝不把列表预览冒充正文：列表行可能已错位，必须留待下一轮重新识别。
+        Log '  → 点开或读取失败：不写预览、不更新锚点，避免错误群聊归属'
+        # 2026-10-29：把"为什么点不开"写到能照做为止。外部复测在这条路上耗了一整晚，
+        #   而三种成因各自对应完全不同的处置方式（遮挡 / 坐标空间 / 输入方式）。
+        if ($null -ne $target) {
+          try {
+            $occ2 = Get-WxOcclusionHint -X $pt.cx -Y $pt.cy -Expect $info.hwnd
+            if ($occ2 -and $occ2.covered) {
+              Log ('        原因①：点击点 ({0},{1}) 现在被 0x{2}「{3}」盖住 —— 窗口被遮挡时 PrintWindow 可能返回旧帧，"点开了没有"本身就不可信；把微信挪到干净位置再试' -f $pt.cx, $pt.cy, $occ2.hwnd.ToInt64().ToString('X'), $occ2.title)
+            }
+          } catch { }
         }
-        Append-Record $rec | Out-Null; $written++
-        Log ("  → 点开两次都没读到面板 → 退回记录列表预览（避免这次变化白丢）")
+        if (-not $script:WxDpiAware -and -not ($script:win.PSObject.Properties['dpiFixed'] -and $script:win.dpiFixed)) {
+          Log ('        原因②：本进程未声明 DPI 感知（{0}）→ 若系统缩放不是 100%，算出来的点会偏（本次点击点 ({1},{2})）' -f $script:WxDpiNote, $pt.cx, $pt.cy)
+        } else {
+          Log ('        坐标空间正常（{0}；窗口 {1}x{2}）→ 排除"缩放导致点偏"' -f $(if ($script:WxDpiAware) { 'DPI 感知已声明' } else { '已按窗口 DPI 校正' }), $info.width, $info.height)
+        }
+        Log ('        原因③：点击方式可能不被微信接受（当前 {0}）→ 本机真实验证 Maa 点击会点偏，微信路径已关闭后台点击' -f $(if ($bgOk) { 'Maa 后台点击' } else { '受保护真实鼠标' }))
+        continue
+      }
+      if (-not $verified) {
+        Log ('  群标题未确认（期望「{0}」，读到「{1}」）→ 不翻页、不写正文和锚点，留待下轮重试' -f $c.name, $header)
         continue
       }
       $parsed2 = $pane.parsed
       if (-not $headerRead) {
-        # 标题没读到（界面被遮挡/渲染异常）：用期望名兜底，并标记未通过校验
-        $header = $c.name
-        Log ("  标题未识别，暂用期望名「{0}」兜底（verified=false）" -f $header)
+        Log ("  标题未识别，放弃本次读取：不以期望名代替实际群名「{0}」，不写正文和锚点" -f $c.name)
+        continue
       }
 
       # ---------- 误入"非聊天界面"（群助手/服务通知…）→ 退回到会话列表再继续 ----------
@@ -863,12 +1303,18 @@ function Invoke-Pass([int]$index) {
       $histNotches = if ($cfg.PSObject.Properties['historyWheelNotches']) { [int]$cfg.historyWheelNotches } else { 3 }
       $histSettle = if ($cfg.PSObject.Properties['historySettleMs']) { [int]$cfg.historySettleMs } else { 350 }
       $histMaxLines = if ($cfg.PSObject.Properties['historyMaxLines']) { [int]$cfg.historyMaxLines } else { 150 }
-      $newestTexts = @($parsed2.chatLines | Sort-Object y | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+      $newestRows = @($parsed2.chatLines | Sort-Object y | ForEach-Object {
+          $t = Format-OcrText $_.text
+          if (-not [string]::IsNullOrWhiteSpace($t)) { [pscustomobject]@{ text = $t; y = [int]$_.y } }
+        })
+      $newestTexts = @($newestRows | ForEach-Object { $_.text })
       # 锚点（2026-10-19）：上一轮记录过的"最旧 3 行"。翻页读到它就停 —— 再往上都是记过的内容，
       # 继续翻只会把同一批历史重新 OCR（费时费 token，还可能让模型重复抽同一条待办）。
       # 2026-10-26 改：① key 换成**稳定标识**（白名单词），不再用会抖的 OCR 群名；
       #   ② 翻页改成"一直翻到锚点为止"（用户要求：避免固定 2 屏漏掉消息）。
       $anchorFile = Join-Path $stateDir 'seen-anchors.txt'
+      $historyRollupPath = Join-Path $stateDir 'history-rollup.json'
+      $historyRollup = Load-Json $historyRollupPath ([pscustomobject]@{})
       # 稳定标识优先取"聊天头部"，但微信的头部 OCR 很不可靠（实测整条读成 "O"），
       # 一旦头部里一个白名单词都没有，就退回**列表里那个会话名**（$c.name，有白名单校验过，更可靠）。
       $stable = Get-ChatStableKey -Name $header -Whitelist $wlList
@@ -887,12 +1333,31 @@ function Invoke-Pass([int]$index) {
       $anchorTime = $null
       $anchorTmp = @($anchorRecs | Where-Object { $_.time } | Sort-Object { $_.time })
       if ($anchorTmp.Count -gt 0) { $anchorTime = $anchorTmp[0].time }
-      $anchorHitFirst = Test-ChatAnchorHit -Lines $newestTexts -Anchors $anchors
+      $anchorFileMissing = ($anchorRecs.Count -eq 0)
+      $longAnchorCount = @($anchors | Where-Object { ([string]$_ -replace '\s', '').Length -ge 6 }).Count
+      $anchorHitFirst = ($longAnchorCount -ge 2 -and (Test-ChatAnchorHit -Lines $newestTexts -Anchors $anchors -MinimumHits 2))
+      $rollup = $historyRollup
+      $rollState = if ($rollup.PSObject.Properties.Name -contains $anchorKey) { $rollup.$anchorKey } else { $null }
+      $nowRoll = Get-PassNow
+      $rollDue = $false
+      $lastWheelAt = $null
+      if ($rollState -and $rollState.lastWheelSuccess) {
+        $lastWheelAt = ConvertTo-ChatAnchorTimeText -Value $rollState.lastWheelSuccess
+        if ($lastWheelAt) { $rollDue = (($nowRoll - $lastWheelAt).TotalMinutes -ge 60) }
+      } else { $rollDue = $true }
+      $rollBacklog = [bool]($rollState -and $rollState.backlog)
+      $historyScanDue = $rollBacklog -or $rollDue
+      if (-not $rollBacklog -and $rollState -and $rollState.lastWheelSuccess) { $rollBacklog = $rollDue }
+      if ($rollBacklog) {
+        $pendingRec = [ordered]@{ lastAttempt = (Get-Date).ToString('o'); lastWheelSuccess = $(if ($lastWheelAt) { $lastWheelAt.ToString('o') } else { $null }); lastFailure = '补扫待进行'; attempted = $false; succeeded = $false; backlog = $true }
+        $historyRollup | Add-Member -NotePropertyMembers @{ ([string]$anchorKey) = [pscustomobject]$pendingRec } -Force
+        if (-not $Peek) { Save-Json $historyRollupPath $historyRollup }
+      }
       # R4（用户原话）：当前界面的时间就是上次锚点的时间 → 没有新消息，一次滚轮都不发。
       $curTimes = Get-ChatTimesFromLines -Lines $newestTexts -Now (Get-PassNow)
       $noNewByTime = [bool]($anchorTime -and $curTimes.newest -and ($curTimes.newest -le $anchorTime))
       if ($anchorHitFirst -and $anchors.Count -gt 0) {
-        Log '  往期滚动：当前屏全是上一轮记录过的内容 → 不往前翻（省时省 token）'
+        Log '  往期滚动：当前屏至少命中两个较长锚点 → 暂不翻页（避免单条常见文本/公告误停）'
       } elseif ($noNewByTime) {
         Log ('  往期滚动：当前屏最新时间 {0:MM-dd HH:mm} ≤ 锚点时间 {1:MM-dd HH:mm} → 没有新消息，不往前翻（不发滚轮）' -f $curTimes.newest, $anchorTime)
       }
@@ -901,59 +1366,165 @@ function Invoke-Pass([int]$index) {
       $histHardMax = if ($cfg.PSObject.Properties['historyMaxScreens']) { [int]$cfg.historyMaxScreens } else { 40 }
       $untilAnchor = if ($cfg.PSObject.Properties['historyUntilAnchor']) { [bool]$cfg.historyUntilAnchor } else { $true }
       $histLimit = if ($untilAnchor -and ($anchors.Count -gt 0 -or $anchorTime)) { $histHardMax } else { $histInitial }
-      if ($anchorHitFirst -or $noNewByTime) { $histLimit = 0 }
+      if ($rollBacklog -or $anchorFileMissing) { $histLimit = $histHardMax }
+      if (($anchorHitFirst -or $noNewByTime) -and -not $rollBacklog) { $histLimit = 0 }
+      if ($rollBacklog) { Log ('  历史补扫：距上次滚轮成功已 {0:N0} 分钟，重新核对时间水位之后的消息' -f ($nowRoll - $lastWheelAt).TotalMinutes) }
       $screens = @(, $newestTexts)
+      $historyUnsafe = $false
+      $wheelAttempted = $false
+      $wheelSucceeded = $false
+      $historyStartLines = @($newestTexts)
+      $wheelFailure = ''
+      $wheelSuccessAt = $null
+      $wheelNotchesSent = 0
+      $wheelScreensChanged = $false
+      $historyBoundaryReached = -not $rollBacklog
+      $historyStableAtTop = $false
+      $historyRestoreSucceeded = -not $rollBacklog
+      $historyAnchorHit = $false
+      $sameScreenStreak = 0
+      if ($rollBacklog) {
+        # 未成功完成补扫前，不允许重复写相同屏；保持原水位，失败会留待下轮重试。
+        $wheelAttempted = $false
+      }
       if ($histLimit -gt 0 -and $histNotches -gt 0) {
-        $moved = Move-WxCursorToChatArea -Hwnd $info.hwnd
-        if (-not $moved) { Log '  往期滚动：光标没能移到聊天区（窗口矩形取不到）→ 跳过' }
-        else {
-          Log ("  往期滚动：目标=翻到上次记录的边界（上限 {0} 屏）" -f $histLimit)
-          $scrolled = 0
-          $prevTexts = $newestTexts
-          for ($hi = 1; $hi -le $histLimit; $hi++) {
-            Invoke-WxWheel -Notches $histNotches
-            Start-Sleep -Milliseconds $histSettle
-            $shotH = Join-Path $shotDir ('hist-{0}-{1}.png' -f ([DateTime]::Now.ToString('HHmmss')), $hi)
-            try {
-              $null = Save-WxWindowShot -Hwnd $info.hwnd -Path $shotH -Scale $ocrScale
-              $rowsH = Invoke-WxOcr -Path $shotH -Scale $ocrScale
-              $parsedH = Get-ChatsFromRows $rowsH
-              $textsH = @($parsedH.chatLines | Sort-Object y | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            } catch {
-              Log ('  往期滚动第 {0} 屏失败：{1}' -f $hi, $_.Exception.Message)
-              $textsH = @()
-            }
-            $scrolled++
-            if ($textsH.Count -eq 0) { Log ('  往期滚动：第 {0} 屏没读到内容（可能到顶了）→ 停止' -f $hi); break }
-            $anchorHit = Test-ChatAnchorHit -Lines $textsH -Anchors $anchors
-            # 停止条件（2026-10-27）：文本命中 **或** 时间越过锚点（OCR 把锚点行读歪时靠时间兜底）
-            $hitTime = $false
-            if ($anchorTime) {
-              $ht = Get-ChatTimesFromLines -Lines $textsH -Now (Get-PassNow)
-              $hitTime = [bool]($ht.oldest -and ($ht.oldest -le $anchorTime))
-              if ($hitTime) { $hitTimeWhy = ('时间越过：本屏最旧 {0:MM-dd HH:mm} ≤ 锚点 {1:MM-dd HH:mm}' -f $ht.oldest, $anchorTime) }
-            }
-            # 到顶判断要跟**上一屏**比（$screens 最后一项）。以前比的是最新那一屏（$screens[0]），
-            # 翻到第 3 屏以后就算已经到顶也发现不了，会白滚到硬上限。
-            $same = (($textsH -join "`n") -eq ($screens[$screens.Count - 1] -join "`n"))
-            if ($same) { Log ('  往期滚动：第 {0} 屏和上一屏一样（到顶/没滚动）→ 停止' -f $hi); break }
-            $screens += , $textsH
-            if ($anchorHit -or $hitTime) {
-              $whyStop = @()
-              if ($anchorHit) { $whyStop += '文本命中锚点' }
-              if ($hitTime) { $whyStop += $hitTimeWhy }
-              Log ('  往期滚动：第 {0} 屏到达上次记录的边界（{1}）→ 停止翻页' -f $hi, ($whyStop -join '；'))
-              break
-            }
+        Log ("  往期滚动：目标=翻到上次记录的边界（上限 {0} 屏）" -f $histLimit)
+        $wheelNotchesSent = 0
+        $wheelScreensChanged = $false
+        $scrolledNotches = 0
+        $mayRestoreHistory = $true
+        $historyCursor = [WxGuardedInput]::Cursor()
+        $sawHistoryContent = $false
+        $historyProbeScreens = @()
+        for ($hi = 1; $hi -le $histLimit; $hi++) {
+          try {
+            $wheelAttempted = $true
+            $sentThisStep = [int](Invoke-WxWheel -Hwnd $info.hwnd -Notches $histNotches -Win $info -Cfg $cfg -SplitX ([int]$script:WxSplitX) -HistoryGuard -HistoryCursor $historyCursor)
+            if ($sentThisStep -le 0) { throw 'INPUT_TARGET_LOST: 滚轮没有确认发送任何刻度' }
+            $scrolledNotches += $sentThisStep
+            $wheelNotchesSent += $sentThisStep
+          } catch {
+            $wheelError = $_.Exception.Message
+            $wheelFailure = $wheelError
+            if ($wheelError -match '已发送 (\d+) 格') { $scrolledNotches += [int]$matches[1] }
+            if ($wheelError -match 'INPUT_ABORTED|已发送 [1-9]\d* 格') { $mayRestoreHistory = $false }
+            Log ('  停止翻页：' + $wheelError)
+            $historyUnsafe = $true
+            break
           }
-          if ($scrolled -gt 0) {
-            # 滚回底部（多滚 2 格贴底），还原用户视图
-            Invoke-WxWheel -Notches (-($histNotches * $scrolled) - 2) -StepDelayMs 40
-            Start-Sleep -Milliseconds 200
-            Log ('  往期滚动：翻了 {0} 屏（画面已滚回底部）' -f ($screens.Count - 1))
+          Start-Sleep -Milliseconds $histSettle
+          $shotH = Join-Path $shotDir ('hist-{0}-{1}.png' -f ([DateTime]::Now.ToString('HHmmss')), $hi)
+          try {
+            $null = Save-WxWindowShot -Hwnd $info.hwnd -Path $shotH -Scale $ocrScale
+            $rowsH = Invoke-WxOcr -Path $shotH -Scale $ocrScale
+            $parsedH = Get-ChatsFromRows $rowsH
+            $pageHeader = Get-ChatHeader $parsedH.chatLines
+            if (-not (Test-ChatHeaderIdentity -Actual $pageHeader -Expected $header)) {
+              Log ('  翻页后标题改变或未识别「{0}」→ 放弃本群，不混合正文' -f $pageHeader)
+              $historyUnsafe = $true; break
+            }
+            $textsH = @($parsedH.chatLines | Sort-Object y | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($textsH.Count -gt 0) {
+              $sawHistoryContent = $true
+              $historyProbeScreens += , $textsH
+            }
+          } catch {
+            Log ('  往期滚动第 {0} 屏截图/OCR失败：{1} → 放弃本群，避免推进锚点' -f $hi, $_.Exception.Message)
+            $textsH = @()
+            $historyUnsafe = $true
+            break
+          }
+          if ($textsH.Count -eq 0) {
+            Log ('  往期滚动：第 {0} 屏没读到内容（可能到顶了）→ 停止' -f $hi)
+            if ($rollBacklog) { $historyUnsafe = $true; $wheelFailure = '空 OCR 不足以确认历史边界' }
+            break
+          }
+          $screenChanged = -not (Test-WxHistoryPageMatches -ExpectedTitle $header -ExpectedLines $historyStartLines -ActualTitle $pageHeader -ActualLines $textsH)
+          if ($screenChanged) { $wheelScreensChanged = $true }
+          $anchorHit = Test-ChatAnchorHit -Lines $textsH -Anchors $anchors -MinimumHits 2
+          # 停止条件（2026-10-27）：文本命中 **或** 时间越过锚点（OCR 把锚点行读歪时靠时间兜底）
+          $hitTime = $false
+          if ($anchorTime) {
+            $ht = Get-ChatTimesFromLines -Lines $textsH -Now (Get-PassNow)
+            $hitTime = [bool]($ht.oldest -and ($ht.oldest -le $anchorTime))
+            if ($hitTime) { $hitTimeWhy = ('时间越过：本屏最旧 {0:MM-dd HH:mm} ≤ 锚点 {1:MM-dd HH:mm}' -f $ht.oldest, $anchorTime) }
+          }
+          # 到顶判断要跟**上一屏**比（$screens 最后一项）。
+          $same = (($textsH -join "`n") -eq ($screens[$screens.Count - 1] -join "`n"))
+          if ($same) { $sameScreenStreak++ } else { $sameScreenStreak = 0 }
+          $screens += , $textsH
+          if ($sameScreenStreak -ge 2) {
+            Log ('  往期滚动：连续 {0} 次画面不变，停止尝试；不能据此证明已到顶' -f ($sameScreenStreak + 1))
+            if ($rollBacklog) { $wheelFailure = '画面连续不变，无法确认到顶或历史边界' }
+            break
+          }
+          if ($anchorHit -or $hitTime) {
+            $whyStop = @()
+            if ($anchorHit) { $whyStop += '文本命中锚点' }
+            if ($hitTime) { $whyStop += $hitTimeWhy }
+            Log ('  往期滚动：第 {0} 屏到达上次记录的边界（{1}）→ 停止翻页' -f $hi, ($whyStop -join '；'))
+            $historyAnchorHit = $true
+            $historyBoundaryReached = $true
+            break
           }
         }
+        if ($scrolledNotches -ne 0 -and $mayRestoreHistory -and $wheelScreensChanged) {
+          # 已确认历史画面确实变化、且没有用户抢鼠标时，才尝试按实际刻度滚回。
+          try {
+            [void](Invoke-WxWheel -Hwnd $info.hwnd -Notches (-$scrolledNotches) -StepDelayMs 40 -Win $info -Cfg $cfg -SplitX ([int]$script:WxSplitX) -HistoryGuard -HistoryCursor $historyCursor)
+            Start-Sleep -Milliseconds $histSettle
+            $restoreShot = Join-Path $shotDir ('hist-{0}-restore.png' -f [DateTime]::Now.ToString('HHmmss'))
+            $null = Save-WxWindowShot -Hwnd $info.hwnd -Path $restoreShot -Scale $ocrScale
+            $restoreRows = Invoke-WxOcr -Path $restoreShot -Scale $ocrScale
+            $restoreParsed = Get-ChatsFromRows $restoreRows
+            $restoreHeader = Get-ChatHeader $restoreParsed.chatLines
+            $restoreTexts = @($restoreParsed.chatLines | Sort-Object y | ForEach-Object { (Format-OcrText $_.text) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $restoreMatches = Test-WxHistoryPageMatches -ExpectedTitle $header -ExpectedLines $historyStartLines -ActualTitle $restoreHeader -ActualLines $restoreTexts
+            $restoreTitleOk = Test-ChatHeaderIdentity -Actual $restoreHeader -Expected $header
+            $restoreContentOk = $restoreMatches
+            if (-not $restoreTitleOk -or -not $restoreContentOk) {
+              $historyRestoreSucceeded = $false
+              $historyUnsafe = $true
+              $wheelFailure = '滚回后标题或首屏正文未与操作前匹配'
+              Log ('  滚回状态未验证：标题匹配={0}，首屏匹配={1}' -f $restoreTitleOk, $restoreContentOk)
+              throw $wheelFailure
+            }
+            $historyRestoreSucceeded = $true
+            if ($sawHistoryContent -and $wheelScreensChanged) { $wheelSucceeded = $true; $wheelSuccessAt = Get-Date }
+            Log ('  往期滚动：实际翻动 {0} 格，已通过标题和首屏正文确认恢复' -f $scrolledNotches)
+          } catch {
+            Log ('  停止恢复滚动：' + $_.Exception.Message)
+            $historyRestoreSucceeded = $false
+            $historyUnsafe = $true
+          }
+        } elseif ($scrolledNotches -ne 0) {
+          Log ('  未确认历史画面变化或用户已接管输入，保留当前滚动位置（已发送 {0} 格），不盲目恢复' -f $scrolledNotches)
+          $historyUnsafe = $true
+          if (-not $wheelFailure) { $wheelFailure = '未确认历史画面变化，未盲目恢复滚动' }
+        }
       }
+      if ($rollBacklog -and -not $historyBoundaryReached) {
+        $historyUnsafe = $true
+        if (-not $wheelFailure) { $wheelFailure = '达到扫描上限但未确认历史边界' }
+      }
+      if ($rollBacklog -and -not $historyUnsafe -and -not $historyAnchorHit -and -not $historyStableAtTop) {
+        $historyUnsafe = $true
+        $wheelFailure = '未找到原锚点且未确认到顶，补扫保持待处理'
+      }
+      if ($rollBacklog -and -not $historyRestoreSucceeded) {
+        $historyUnsafe = $true
+        if (-not $wheelFailure) { $wheelFailure = '未成功恢复原滚动位置' }
+      }
+      if ($historyUnsafe) {
+        $rollRec = [ordered]@{ lastAttempt = (Get-Date).ToString('o'); lastWheelSuccess = $(if ($lastWheelAt) { $lastWheelAt.ToString('o') } else { $null }); lastFailure = $wheelFailure; attempted = $wheelAttempted; succeeded = $false; backlog = $true }
+        $historyRollup | Add-Member -NotePropertyMembers @{ ([string]$anchorKey) = [pscustomobject]$rollRec } -Force
+        if (-not $Peek) { Save-Json $historyRollupPath $historyRollup }
+        Log '  本群操作被中断，不写正文或更新锚点；已记录滚轮水位，待下次可滚动时补扫'
+        continue
+      }
+      # 只在整轮历史操作和回到底部都成功后，才把 backlog 标为完成；写 spool/锚点后再持久化完成水位。
+      # 真实滚轮发送记在时间字段；不把当前轮启动时间伪装成“已检查完成”。
+      if ($wheelSucceeded) { $rollWheelTime = $wheelSuccessAt }
       # 合并（从最新一屏往前拼）。两层去重缺一不可：
       #   ① 精确的重叠检测（older 尾部 == newer 头部，连续 k 行）—— 滚动正好错开半屏时最准；
       #   ② **内容去重**（同一行文本已在合并结果里出现过就丢弃）—— OCR 对同一行偶尔会有细微差异，
@@ -1001,11 +1572,12 @@ function Invoke-Pass([int]$index) {
       # ⚠️ 规则要按**实际点开的那个群**（$header）算，不能按"本意想点的"（$c.name）：
       #    点串行时（列表重排/坐标偏移）会拿错规则去过滤别的群的内容 —— 实测点错到"示例群G"，
       #    却按 <示例群号> 群的 all 规则把它的正文整段收了进来。
-      $ruleName = if ([string]::IsNullOrWhiteSpace($header)) { $c.name } else { $header }
-      $rule2 = Get-ChatRule -Name $ruleName -Rules $rules -DefaultMode $defMode -DefaultKeywords $defKw
       if (-not $verified) {
-        Log ("  ⚠️ 点开的不是本意群（想点「{0}」，实际「{1}」）→ 改按实际群的规则过滤" -f $c.name, $header)
+        Log '  标题身份不确定，已在正文过滤前终止，不按期望群规则继续处理'
+        continue
       }
+      $ruleName = $header
+      $rule2 = Get-ChatRule -Name $ruleName -Rules $rules -DefaultMode $defMode -DefaultKeywords $defKw
       if ($rule2.mode -ne 'all') {
         $onlyKw = @(Select-KeywordLines -Lines $cleanLines -Keywords $rule2.keywords)
         if ($onlyKw.Count -eq 0) {
@@ -1017,8 +1589,9 @@ function Invoke-Pass([int]$index) {
 
       $text = (($cleanLines | ForEach-Object { $_.t }) -join "`n")
       $hash = (Get-FileHash -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($text))) -Algorithm SHA1).Hash
+      $hashKnown = ($hashes.PSObject.Properties.Name -contains $header)
       $isNew = $true
-      if ($hashes.PSObject.Properties.Name -contains $header) { if ($hashes.$header -eq $hash) { $isNew = $false } }
+      if ($hashKnown -and $hashes.$header -eq $hash) { $isNew = $false }
       # ⚠️ 2026-10-15 修：$header 为空时 Add-Member -NotePropertyName "" 会抛
       #   "NotePropertyName 参数不能使用可转换为类型 PSMemberTypes 的值"（20:04 实测踩到）。
       #   空标题只跳过哈希簿记，不影响下面的记录流程（记录里 chat=$header 为空也能被插件容错）。
@@ -1036,7 +1609,9 @@ function Invoke-Pass([int]$index) {
         $hashes | Add-Member -NotePropertyMembers @{ ([string]$header) = $hash } -Force
       }
 
-      if ($text.Length -lt 4) {
+      if ($hashKnown -and -not $isNew) {
+        Log '  → 正文与上次成功记录完全相同，抑制重复 spool 记录（changed=false 不进入消费游标）'
+      } elseif ($text.Length -lt 4) {
         # 兜底：正文没读到（渲染慢/被遮挡）也不能让这次"有变化"白丢 —— 至少把列表里的预览记下来
         $rec = [ordered]@{
           kind = 'preview'; ts = (Get-Date).ToString('o'); source = 'wechat-screenshot-ocr'
@@ -1049,6 +1624,16 @@ function Invoke-Pass([int]$index) {
         # R6（2026-10-27）：消息发送时间结构化（以前只藏在正文第一行的 "昨天19：22" 里）。
         $recTimes = Get-ChatTimesFromLines -Lines $merged -Now (Get-PassNow)
         $sendIso = if ($recTimes.oldest) { $recTimes.oldest.ToString('o') } else { $null }
+        $anchorRecords = @()
+        $runningTime = $null
+        foreach ($line0 in @($merged)) {
+          $lineText = [string]$line0
+          $lineTime = ConvertFrom-ChatTimeText -Text $lineText -Now (Get-PassNow)
+          if ($lineTime) { $runningTime = $lineTime }
+          if ((Norm $lineText).Length -ge 6 -and (Norm $lineText) -notmatch '^(群聊成员|群成员|群公告|公告)$') {
+            $anchorRecords += [pscustomobject]@{ line = $lineText; time = $runningTime }
+          }
+        }
         $rec = [ordered]@{
           kind = 'chat'; ts = (Get-Date).ToString('o'); source = 'wechat-screenshot-ocr'
           chat = $header; expected = $c.name; verified = $verified
@@ -1058,14 +1643,24 @@ function Invoke-Pass([int]$index) {
         }
         Append-Record $rec | Out-Null; $written++
         # 记下"这一轮记到的最旧 3 行 + 它们的发送时间"：下一轮翻页读到它就停（2026-10-19 / 2026-10-27）
-        if (-not $Peek) { Save-ChatAnchors -AnchorFile $anchorFile -Key $anchorKey -Lines $merged -ConsolidateFuzzy $stable -ConsolidateWhitelist $wlList -Time $recTimes.oldest }
+        if (-not $Peek) { Save-ChatAnchors -AnchorFile $anchorFile -Key $anchorKey -Lines $merged -ConsolidateFuzzy $stable -ConsolidateWhitelist $wlList -Time $recTimes.oldest -Records $anchorRecords }
         Log ("  → 标题「{0}」 校验={1} 内容变化={2} 正文 {3} 字" -f $header, $verified, $isNew, $text.Length)
+      }
+      if (-not $Peek -and $historyScanDue -and -not $historyUnsafe) {
+        $rollRec = [ordered]@{ lastAttempt = (Get-Date).ToString('o'); lastWheelSuccess = $(if ($wheelSucceeded -and $rollWheelTime) { $rollWheelTime.ToString('o') } elseif ($lastWheelAt) { $lastWheelAt.ToString('o') } else { $null }); lastFailure = ''; attempted = $wheelAttempted; succeeded = [bool]$wheelSucceeded; backlog = $false }
+        $historyRollup | Add-Member -NotePropertyMembers @{ ([string]$anchorKey) = [pscustomobject]$rollRec } -Force
+        Save-Json $historyRollupPath $historyRollup
+        if ($rollBacklog) { Log '  历史补扫完成：本轮正文和锚点已写入，backlog 已清除' }
       }
       if (-not $SaveShots) { Remove-Item -LiteralPath $shot2 -Force -ErrorAction SilentlyContinue }
     }
     if (-not $NoRestoreFocus -and $prevFg -ne [IntPtr]::Zero) {
       [void](Set-WxForegroundRaw -Hwnd $prevFg)
       Start-Sleep -Milliseconds 200
+    }
+    if ($script:WxRestoreAfterPass) {
+      Clear-WxPseudoState
+      Log ('已恢复微信原始窗口状态：{0}' -f $restoreState)
     }
   }
 
@@ -1087,9 +1682,10 @@ function Invoke-Pass([int]$index) {
     Save-Json $hashPath $hashes
   }
   # 伪最小化用完要还原（本来是收起来的就再收回去，别留一个看不见的窗口在外面）
-  if ($pseudoOldEx -ne $null) {
-    [void](Exit-WxPseudoMinimize -Hwnd $info.hwnd -OldExStyle $pseudoOldEx -RestoreState $restoreState)
-    Log '已还原微信窗口状态（伪最小化结束）'
+  if ($pseudoOldEx -ne $null -or $script:WxRestoreAfterPass -or $script:WxPassForeground -ne [IntPtr]::Zero) {
+    Clear-WxPseudoState
+    $pseudoOldEx = $null
+    Log ('已恢复微信原始窗口状态：{0}' -f $restoreState)
   } elseif ($wasMinimized -and $AllowClick) {
     [void](Minimize-WxWindow -Hwnd $info.hwnd)
     Log '读完已把微信窗口收回最小化'
@@ -1106,29 +1702,143 @@ function Get-SpoolCount {
   return $n
 }
 
+# ================= 布局标定（-Calibrate，2026-10-29）=================
+# 目的：让"换台机器 / 换个缩放 / 拉一下窗口"不用改代码也不用猜配置 ——
+#   跑一次就量出这台机器上的真实布局，写成 layout-profile.txt，之后按「像素常数 × DPI 系数」算。
+# 量什么：窗口物理尺寸、DPI、DPI 系数、会话列表宽度（用聊天面板群名左边界反推）、
+#         标题条下沿、行距、以及"能不能正常读到会话"。
+function Invoke-WxCalibrate {
+  $info = Get-WxWindowInfo
+  if ($null -eq $info) {
+    Write-Host '找不到微信主窗口 —— 请先打开微信（窗口标题含"微信"）再标定。'
+    return 1
+  }
+  if ($info.minimized -or $info.width -lt 200 -or $info.left -lt -10000) {
+    Write-Host '微信窗口当前是最小化/折叠态，先恢复再标定…'
+    [void](Restore-WxWindow -Hwnd $info.hwnd)
+    Start-Sleep -Milliseconds 1500
+    $info = Get-WxWindowInfo
+  }
+  $script:win = $info
+  $f = Get-WxDpiFactorOf $info
+  $prof = Get-WxLayoutProfile -Win $info -Cfg $cfg
+
+  Write-Host ''
+  Write-Host '=== 微信布局标定 ==='
+  Write-Host ("窗口        : {0}x{1} @ ({2},{3}) hwnd=0x{4}" -f $info.width, $info.height, $info.left, $info.top, $info.hwnd.ToInt64().ToString('X'))
+  Write-Host ("DPI         : {0}（系数 {1:N2}）  感知={2}" -f $info.dpi, $f, $info.dpiAware)
+  Write-Host ("坐标空间    : " + $(if ($info.dpiAware) { '物理像素（已声明 DPI 感知）' } elseif ($info.dpiFixed) { '物理像素（按 DPI 校正）' } else { '⚠️ 虚拟像素 —— 缩放不是 100% 时会点歪' }))
+
+  # 截图 + OCR，量真实的行位置
+  $shot = Join-Path $shotDir 'calibrate.png'
+  $scale = [int]$cfg.scale
+  $null = Save-WxWindowShot -Hwnd $info.hwnd -Path $shot -Scale $scale
+  $rows = @(Invoke-WxOcr -Path $shot -Scale $scale)
+  Write-Host ("OCR 行数    : {0}" -f $rows.Count)
+
+  # 列表宽度：用"标题条里最靠上的一簇"（=聊天面板群名）的左边界反推；没有聊天打开时退回档案/比例
+  $lo = [int]($info.width * 0.30)
+  $stripLimit = [int]($info.height * 0.12)
+  $band = @($rows | Where-Object { $_ -and $_.y -le $stripLimit -and $_.x -ge $lo -and -not [string]::IsNullOrWhiteSpace($_.text) })
+  $measured = 0
+  $measuredHow = '没打开聊天面板，量不到（按当前档案/比例）'
+  if ($band.Count -gt 0) {
+    $minY = [int](($band | Measure-Object -Property y -Minimum).Minimum)
+    $cluster = @($band | Where-Object { ([int]$_.y - $minY) -le 8 })
+    $titleMinX = [int](($cluster | Measure-Object -Property x -Minimum).Minimum)
+    $measured = $titleMinX - 6
+    $measuredHow = ('按聊天面板群名左边界 x={0} 反推' -f $titleMinX)
+  }
+  $split = if ($measured -gt 0) { $measured } else { [int]$prof.splitX }
+  $listWidthPx = [int][Math]::Round($split / $f)
+  Write-Host ("列表宽度    : {0}px（96DPI 折算 {1}px；{2}）" -f $split, $listWidthPx, $measuredHow)
+  Write-Host ("标题条下沿  : {0}px（96DPI 折算 {1}px）" -f $prof.titleY, [int][Math]::Round($prof.titleY / $f))
+  Write-Host ("分界来源    : {0}" -f $(if ($prof.splitSource -eq 'profile') { '已有布局档案' } else { '配置比例（尚未标定）' }))
+
+  # 用这个分界试解析一次会话列表，看能不能读出会话（能读出来才算标定成功）
+  $script:WxSplitOverride = 0
+  $parsed = Get-ChatsFromRows $rows
+  $sess = @($parsed.chats)
+  Write-Host ("会话识别    : {0} 个{1}" -f $sess.Count, $(if ($sess.Count -gt 0) { ' → ' + (($sess | ForEach-Object { $_.name }) -join ' | ') } else { '' }))
+  Write-Host ("行距        : {0}px（自适应={1}）" -f $parsed.rowGap, $parsed.gapAuto)
+
+  $ok = ($sess.Count -ge 1) -and ($info.dpiAware -or $info.dpiFixed)
+  if (-not $ok -and $sess.Count -eq 0) {
+    Write-Host ''
+    Write-Host '⚠️ 一个会话都没读到 —— 先确认微信停在会话列表（不是收藏/设置页），再重跑一次。'
+    Write-Host '   （本次不写档案，避免把错的布局固化下来）'
+    return 1
+  }
+
+  # 写档案（key=value 文本，刻意不用 JSON：见 wxlib 里的说明）
+  # ⚠️ 只有**真量到**（打开着聊天面板）才写 listWidthPx。
+  #   量不到时写进去的只是比例换算值，等于把"猜的数"固化成档案，反而更难发现错 —— 宁可不写。
+  $path = Get-WxLayoutProfilePath
+  $lines = @(
+    '# 微信采集器 布局档案（由 采集器.ps1 -Calibrate 生成）'
+    ('# 生成时间 {0:yyyy-MM-dd HH:mm:ss}；窗口 {1}x{2}；DPI {3}（系数 {4:N2}）' -f (Get-Date), $info.width, $info.height, $info.dpi, $f)
+    '# 数值都是"96DPI 下的像素"，运行时按 当前DPI/96 换算 —— 所以换缩放不用重新标定。'
+  )
+  if ($measured -gt 0) {
+    $lines += ('listWidthPx={0}' -f $listWidthPx)
+    $lines += ('# listWidthPx 来源：{0}' -f $measuredHow)
+  } else {
+    $lines += '# listWidthPx 未写入：标定时没有打开聊天面板，量不到列表宽度（运行时按标题条自校准）'
+  }
+  $lines += ('titleStripPx={0}' -f [int][Math]::Round($prof.titleY / $f))
+  $lines += ('listCapPx={0}' -f $prof.listCapPx)
+  $lines += ('rowGapPx={0}' -f [int][Math]::Round([double]$parsed.rowGap / $f))
+  $lines += ('calibratedAt={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+  $lines += ('calibratedWin={0}x{1}' -f $info.width, $info.height)
+  $lines += ('calibratedDpi={0}' -f $info.dpi)
+  [System.IO.File]::WriteAllLines($path, $lines, (New-Object System.Text.UTF8Encoding($true)))
+  $script:WxLayoutProfileCache = $null
+  Write-Host ''
+  Write-Host ("✅ 已写入布局档案：{0}" -f $path)
+  if ($measured -le 0) {
+    Write-Host '   ⚠️ 这次没打开聊天面板 → 列表宽度没写进档案（只记了标题条/行距）。'
+    Write-Host '      想让档案更准：先手动点开任意一个群，再跑一次 -Calibrate。'
+  }
+  Write-Host '   之后无论系统缩放到 100%/125%/150%/175%/200%，都按这份档案的像素常数自动换算。'
+  return 0
+}
+
 $pass = 0
+if ($Calibrate) {
+  $rc = Invoke-WxCalibrate
+  exit $rc
+}
 do {
   $pass++
   Log ('===== 第 {0} 轮 =====' -f $pass)
   # 状态写在**执行之后**并反映真实结果（1550 版写在执行之前 → 本轮出错也报成功，与这套机制的目的相反）
-  $passOk = $true; $passNote = ''; $script:skipNote = ''
+  $passOk = $true; $passNote = ''; $script:skipNote = ''; $script:WxStatusKind = ''
   try { [void](Invoke-Pass $pass) } catch {
       # 2026-10-16 加：把**出错位置**也写进日志 —— 原来只记 Exception.Message，
       # 遇到"Add-Member 参数校验"这类错根本不知道是脚本哪一行（真事故：19:04 起每轮都崩，只能靠猜）。
       $passOk = $false
+      try { Clear-WxPseudoState } catch { Log ('⚠️ 异常后窗口/焦点清理失败：' + $_.Exception.Message) }
       $where = ''
       try { $where = ($_.InvocationInfo.PositionMessage -replace '\s+', ' ').Trim() } catch { }
       $passNote = '本轮出错：' + $_.Exception.Message + $(if ($where) { '｜位置：' + $where } else { '' })
       Log $passNote
     }
-  Write-RunStatus -Name '采集器-微信' -Code $(if ($passOk) { 0 } else { 1 }) -Note ($passNote + $script:skipNote)
+  $statusKind = if (-not $passOk) { 'failure' } elseif ($script:WxStatusKind -eq 'env-skip') { 'env-skip' } else { 'complete' }
+  # 2026-11-06：离线 fixture 跑（-OcrRows，测试-解析.ps1 用）**不是真实采集**，不能写运行状态——
+  #   否则自检里的"采集器 最近一轮 N 分钟前"会被测试刷新成"刚跑过"，真实故障就被掩盖了
+  #   （实测：14:04 计划任务那轮的健康状况，被 14:04:45 的 fixture 运行盖掉）。
+  if (-not $OcrRows) {
+    Write-RunStatus -Name '采集器-微信' -Code $(if ($passOk) { 0 } else { 1 }) -Kind $statusKind -Note ($passNote + $script:skipNote)
+  }
   if ($Once) { break }
   if ($Passes -gt 0 -and $pass -ge $Passes) { break }
   Start-Sleep -Seconds $Interval
 } while ($true)
 
-$script:logLines | Set-Content -LiteralPath (Join-Path $logDir 'last-pass.txt') -Encoding UTF8
-Write-Host ("日志：{0}" -f (Join-Path $logDir 'last-pass.txt'))
+# 同上：fixture 运行写单独文件，别覆盖生产日志 last-pass.txt
+$logName = if ($OcrRows) { 'last-pass-test.txt' } else { 'last-pass.txt' }
+$script:logLines | Set-Content -LiteralPath (Join-Path $logDir $logName) -Encoding UTF8
+Write-Host ("日志：{0}" -f (Join-Path $logDir $logName))
 
 
 

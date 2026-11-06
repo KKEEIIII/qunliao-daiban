@@ -45,7 +45,13 @@ function Start-QqRead {
     return [pscustomobject]@{ ok = $false; reason = ('MaaFramework 加载失败（' + $hint + '）：' + $why); win = $null }
   }
   $win = Find-QqWindow -Config $Config -Verify:(-not $NoVerify) -ProbeDir $ProbeDir
-  if (-not $win) { return [pscustomobject]@{ ok = $false; reason = '没找到真实 QQ 窗口（面板没开 / 全部候选截出来是空白）'; win = $null } }
+  if (-not $win) {
+    # 2026-11-06：把"进程没跑"和"面板没开"分开说 —— 实测常见是进程在跑、主面板收进了托盘，
+    #   而日志一律写"面板没开"会让用户以为检测坏了。
+    $procs = @(Get-Process -Name ($(if ($Config.processName) { $Config.processName } else { 'QQ' })) -ErrorAction SilentlyContinue)
+    $why = if ($procs.Count -gt 0) { 'QQ 主面板没打开（进程在跑；可能收进托盘，或截图全是空白）' } else { 'QQ 没运行（没有 QQ 进程）' }
+    return [pscustomobject]@{ ok = $false; reason = $why; win = $null }
+  }
   if (-not (Initialize-Maa)) { return [pscustomobject]@{ ok = $false; reason = 'MaaFramework 初始化失败'; win = $win } }
   $method = if ($Config.maaInputMethod) { [uint64]$Config.maaInputMethod } else { [uint64]1024 }
   # 截图方式（2026-10-26 查官方文档 + 实测）：
@@ -90,9 +96,17 @@ function Start-QqRead {
 
 function Stop-QqRead {
   param($Ctx)
-  if ($Ctx -and $Ctx.ctrl -ne [IntPtr]::Zero) { try { [MaaApi]::MaaControllerDestroy($Ctx.ctrl) } catch {} }
-  if ($Ctx -and $Ctx.ctrlClick -ne [IntPtr]::Zero) { try { [MaaApi]::MaaControllerDestroy($Ctx.ctrlClick) } catch {} }
-  if ($Ctx -and $Ctx.PSObject.Properties['ctrlScroll'] -and $Ctx.ctrlScroll -ne [IntPtr]::Zero) { try { [MaaApi]::MaaControllerDestroy($Ctx.ctrlScroll) } catch {} }
+  # 控制器可能因缓存/输入法配置共享同一 native handle；重复 Destroy 会触发 Maa 堆损坏。
+  $seen = @{}
+  foreach ($p in @('ctrl','ctrlClick','ctrlScroll')) {
+    if (-not $Ctx -or -not $Ctx.PSObject.Properties[$p]) { continue }
+    $h = $Ctx.$p
+    if ($h -eq [IntPtr]::Zero) { continue }
+    $key = $h.ToInt64().ToString()
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    try { [MaaApi]::MaaControllerDestroy($h) } catch {}
+  }
 }
 
 function Get-QqShot {
@@ -120,17 +134,19 @@ function Get-QqSessionRows {
   if ($W -le 0 -or $H -le 0) { return @() }
 
   # 行几何：优先用 config 里的抓图空间像素值，换算成比例；否则用实测默认
-  $rowH = if ($cfg.rowHeight) { [double]$cfg.rowHeight } else { 57 }
-  $firstY = if ($cfg.firstRowY) { [double]$cfg.firstRowY } else { 120 }
-  if ($RowHeightOverride -gt 0) { $rowH = $RowHeightOverride }
-  if ($FirstRowYOverride -gt 0) { $firstY = $FirstRowYOverride }
+  $rowOverride = $RowHeightOverride -gt 0
+  $firstOverride = $FirstRowYOverride -gt 0
+  $rowH = if ($rowOverride) { [double]$RowHeightOverride } elseif ($cfg.rowHeight) { [double]$cfg.rowHeight } else { 57 }
+  $firstY = if ($firstOverride) { [double]$FirstRowYOverride } elseif ($cfg.firstRowY) { [double]$cfg.firstRowY } else { 120 }
+  # override 来自当前截图的像素坐标；配置默认值来自基准 720px 截图。
   $avatarX = if ($cfg.avatarX) { [double]$cfg.avatarX } else { 137 }
-  # config 里给的是"抓图 1079x720"标定值，按实际抓图尺寸等比缩放
-  $rowHn = $rowH / 720.0
-  $firstYn = $firstY / 720.0
+  $rowHn = if ($rowOverride) { $rowH / $H } else { $rowH / 720.0 }
+  $firstYn = if ($firstOverride) { $firstY / $H } else { $firstY / 720.0 }
   $avatarXn = $avatarX / 1079.0
 
-  $x1 = $W * [double]$cfg.sessionXFrom; $x2 = $W * [double]$cfg.sessionXTo; $y0 = $H * [double]$cfg.listYFrom
+  $x1 = $W * [double]$cfg.sessionXFrom; $x2 = $W * [double]$cfg.sessionXTo
+  # 首行名字位于中心上方，避免裁掉置顶群名而只留下预览。
+  $y0 = [Math]::Max($H * 0.08, [Math]::Min($H * [double]$cfg.listYFrom, ($firstYn - $rowHn * 0.79) * $H))
   $inList = @($Rows | Where-Object { $_.x -ge $x1 -and $_.x -le $x2 -and $_.y -ge $y0 } | Sort-Object y)
   if ($inList.Count -eq 0) { return @() }
 
@@ -147,12 +163,12 @@ function Get-QqSessionRows {
     $lines = @($inList | Where-Object { $_.y -ge ($cy - $halfUp) -and $_.y -le ($cy + [int]($rowHn * $H * 0.21)) })
     if ($lines.Count -eq 0) { continue }
     # 会话名 = 最靠左的那条（头像右边），去掉时间戳数字尾巴
-    $nameLine = ($lines | Sort-Object x | Select-Object -First 1)
+    $nameLine = ($lines | Sort-Object @{Expression='x';Ascending=$true}, @{Expression='y';Ascending=$true} | Select-Object -First 1)
     $name = ($nameLine.text -replace ' ', '').Trim()
-    # 点击 y 用"这一行自己的文字"定位（最后一条文字下方 8px），**不依赖行距**：
-    # 实测行距会随 QQ 缩放变化（57 / 72），而"名字行 + 预览行"的相对位置是稳定的。
-    $lastLineY = ($lines | Sort-Object y | Select-Object -Last 1).y
-    $clickY = [int]([math]::Min($cy + ($rowHn * $H * 0.45), $lastLineY + 8))
+    # 点击 y 必须绑定群名行，不能取区域最后一条 OCR 行：最后一条通常是预览/时间，
+    # 会把点击点推到下一行。群名行下方约半行距是行内安全区，随缩放按当前抓图像素计算。
+    $nameY = [int]$nameLine.y
+    $clickY = [int][Math]::Round($nameY + (($rowHn * $H) * 0.42))
     $out += [pscustomobject]@{
       index  = $i + 1
       y      = [int][math]::Round($cy)
@@ -261,15 +277,15 @@ function Invoke-QqClickRow {
   $ok = $false
   $focused = ([WxNative]::GetForegroundWindow() -eq $Ctx.win.hwnd)
   if (-not $focused) {
-    # 先试着激活 QQ：实测在后台脚本里 SetForegroundWindow 也能成功（返回 True）。
-    # 激活后就能走 Maa 的 AnchoredTouch —— 它既不动鼠标，目标点被别的窗口盖住时还会自己把窗口临时提上来。
-    $focused = Enable-QqFocus -Ctx $Ctx
+    # 不抢焦点：用户切到别的应用时，真实输入必须停止，避免误点。
+    # Maa 后台点击仍可用，但先确认窗口句柄仍有效；失败直接返回，不降级成全局鼠标点击。
+    if (-not [WxNative]::IsWindowVisible($Ctx.win.hwnd)) { return $false }
   }
-  if ($focused) {
+  if ($focused -or ($Ctx.PSObject.Properties['ctrlClick'] -and $Ctx.ctrlClick -ne [IntPtr]::Zero)) {
     $ok = Invoke-MaaClick -Hwnd $Ctx.win.hwnd -X $x -Y $y -Controller $Ctx.ctrlClick
   } else {
     # 换算到屏幕坐标
-    $win = $Ctx.win
+    $win = Update-QqWindowRect -Ctx $Ctx
     $sx = $win.w / [double]$Ctx.captureW
     $sy = $win.h / [double]$Ctx.captureH
     $px = [int]($win.x + $x * $sx)
@@ -316,6 +332,42 @@ function Get-QqLevenshtein([string]$a, [string]$b) {
     $tmp = $prev; $prev = $cur; $cur = $tmp
   }
   return $prev[$m]
+}
+
+function Test-QqHeaderExact {
+  param([string]$Name, [string]$Pattern)
+  # 2026-11-06：**放宽到"能认出同一个群"**，但仍不做任意包含（防"示例部门"吃掉"示例部门小组"）。
+  #   真机踩到的两类误丢（覆盖率 4/7 的主因）：
+  #     ① 头部比白名单词多了前缀/后缀：`第一次示例群I（11）` vs `示例群I`
+  #     ② 群号型白名单：`示例群A（52）` vs `<示例群号>`
+  #   原来只认「相等 / 数字前缀 / 短词前缀」，于是这两类被当成"标题不符"整条丢弃。
+  $strip = { param($s)
+    $t = ([string]$s -replace '\s', '')
+    $t = $t -replace '[（(][^）)]*[）)]', ''     # 去掉**所有**括号段（群人数/官方/届别标注）
+    return $t
+  }
+  $a = & $strip $Name; $b = & $strip $Pattern
+  if ($a.Length -lt 2 -or $b.Length -lt 2) { return $false }
+  if ($a -eq $b) { return $true }
+  # ① 群号型白名单（≥5 位数字）：标题里出现同一串数字就是同一个群（群号是最强标识）
+  if ($b -match '^\d{5,}$' -and $a.Contains($b)) { return $true }
+  # ② 长名截断：短的那个是长的前缀，且长度 ≥4（"示例群A" ⊂ "示例群A前缀2班"）
+  $shorter = if ($a.Length -le $b.Length) { $a } else { $b }
+  $longer = if ($a.Length -gt $b.Length) { $a } else { $b }
+  if ($shorter.Length -ge 4 -and $longer.StartsWith($shorter, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+  # ③ 头部带前缀修饰：白名单词出现在标题**结尾**且长度 ≥3（"第一次示例群I" ← "示例群I"）
+  if ($b.Length -ge 3 -and $a.EndsWith($b, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+  # ④ QQ 偶尔把 1-4 位年级/班级数字拼到小群名前（"26示例部门小组"）：去数字前缀后必须全文相等
+  if ($b.Length -ge 5 -and $a -match '^[0-9]{1,4}.+$') {
+    $withoutNumericPrefix = $a -replace '^[0-9]{1,4}', ''
+    if ($withoutNumericPrefix -ieq $b) { return $true }
+  }
+  # ⑤ 短白名单词做前缀（示例群B/示例部门/示例学校新闻/示例群F）
+  if ($b.Length -le 4 -and $a.StartsWith($b, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+  # ⑥ 2 字词出现在标题**中间**（"示例群F（128）" ← "示例群F"）。
+  #   刻意排除"出现在开头"：那正是 示例部门 / 示例部门小组 这种"短词是长词前缀"的混淆场景（由 ⑤ 之外单独处理）。
+  if ($b.Length -eq 2 -and $a.IndexOf($b, [System.StringComparison]::OrdinalIgnoreCase) -gt 0) { return $true }
+  return $false
 }
 
 function Test-QqMatchText {
@@ -382,17 +434,73 @@ function Invoke-QqScrollList {
   }
   return $ok
 }
-function Get-QqListScreenPoint {
-  <#
-    .SYNOPSIS  会话列表中心对应的**屏幕坐标**（滚轮事件要用真实光标位置）
-  #>
+function Update-QqWindowRect {
   param([Parameter(Mandatory = $true)]$Ctx)
-  $win = $Ctx.win
+  $r = Get-WxPhysicalRect -Hwnd $Ctx.win.hwnd
+  if (-not $r -or $r.width -le 0 -or $r.height -le 0 -or $Ctx.captureW -le 0 -or $Ctx.captureH -le 0) {
+    throw 'INPUT_TARGET_LOST: QQ 窗口或截图尺寸无效'
+  }
+  $Ctx.win.x = $r.left; $Ctx.win.y = $r.top
+  $Ctx.win.w = $r.width; $Ctx.win.h = $r.height
+  return $Ctx.win
+}
+
+function Test-QqWheelPoint {
+  <# 给离线测试留一个可替换的遮挡判定边界；实际仍以顶层窗口句柄为准。 #>
+  param([Parameter(Mandatory = $true)]$Ctx, [int]$X, [int]$Y)
+  try { return ([WxNative]::TopAt($X, $Y) -eq $Ctx.win.hwnd) } catch { return $false }
+}
+
+function Get-QqWheelScreenPoint {
+  <#
+    .SYNOPSIS  在 QQ 指定区域内选一个未被遮挡的滚轮点，不激活窗口。
+    .PARAMETER Area list | chat
+    .DESCRIPTION
+      先生成多组区域内候选点，再用 TopAt 验证点下方仍是 QQ。
+      Invoke-TargetWindowWheel 发送前还会再次验证，遮挡发生竞态时仍安全失败。
+  #>
+  param([Parameter(Mandatory = $true)]$Ctx, [ValidateSet('list','chat')][string]$Area = 'list')
+  $win = Update-QqWindowRect -Ctx $Ctx
+  if ($Ctx.captureW -le 0 -or $Ctx.captureH -le 0) { throw 'INPUT_TARGET_LOST: QQ 截图尺寸无效' }
+  $cfg = $Ctx.cfg
+  if ($Area -eq 'chat') {
+    $x1 = if ($cfg.PSObject.Properties['chatXFrom']) { [double]$cfg.chatXFrom } else { 0.28 }
+    $x2 = if ($cfg.PSObject.Properties['chatXTo']) { [double]$cfg.chatXTo } else { 0.78 }
+    $y1 = if ($cfg.PSObject.Properties['chatYFrom']) { [double]$cfg.chatYFrom } else { 0.30 }
+    $y2 = if ($cfg.PSObject.Properties['chatYTo']) { [double]$cfg.chatYTo } else { 0.88 }
+    # 聊天正文区域内三列 × 三行，避开标题栏和底部输入框。
+    $xFracs = @(0.22, 0.50, 0.78)
+    $yFracs = @(0.35, 0.55, 0.75)
+  } else {
+    $x1 = if ($cfg.PSObject.Properties['sessionXFrom']) { [double]$cfg.sessionXFrom } else { 0.08 }
+    $x2 = if ($cfg.PSObject.Properties['sessionXTo']) { [double]$cfg.sessionXTo } else { 0.35 }
+    $y1 = if ($cfg.PSObject.Properties['listYFrom']) { [double]$cfg.listYFrom } else { 0.15 }
+    $y2 = 0.94
+    # 列表区域内三列 × 三行，不依赖头像列的单一固定坐标。
+    $xFracs = @(0.24, 0.50, 0.76)
+    $yFracs = @(0.28, 0.52, 0.76)
+  }
+  $script:QqWheelObstructed = $false
+  if ($x2 -le $x1 -or $y2 -le $y1) { throw ('INPUT_TARGET_LOST: QQ {0} 区域比例无效' -f $Area) }
   $sx = $win.w / [double]$Ctx.captureW
   $sy = $win.h / [double]$Ctx.captureH
-  $px = [int]($win.x + 137 * $sx)                 # 抓图空间里头像列的 x ≈ 137
-  $py = [int]($win.y + ($Ctx.captureH * 0.5) * $sy)
-  return [pscustomobject]@{ x = $px; y = $py }
+  foreach ($yf in $yFracs) {
+    foreach ($xf in $xFracs) {
+      $cx = $x1 + ($x2 - $x1) * $xf
+      $cy = $y1 + ($y2 - $y1) * $yf
+      $px = [int][Math]::Round($win.x + ($Ctx.captureW * $cx) * $sx)
+      $py = [int][Math]::Round($win.y + ($Ctx.captureH * $cy) * $sy)
+      if ($px -lt $win.x -or $px -ge ($win.x + $win.w) -or $py -lt $win.y -or $py -ge ($win.y + $win.h)) { continue }
+      if (Test-QqWheelPoint -Ctx $Ctx -X $px -Y $py) { return [pscustomobject]@{ x = $px; y = $py; area = $Area } }
+    }
+  }
+  $script:QqWheelObstructed = $true
+  throw ('INPUT_TARGET_LOST: QQ {0} 区域的滚轮候选点均被遮挡' -f $Area)
+}
+
+function Get-QqListScreenPoint {
+  param([Parameter(Mandatory = $true)]$Ctx)
+  return (Get-QqWheelScreenPoint -Ctx $Ctx -Area 'list')
 }
 
 function Invoke-QqWheel {
@@ -403,20 +511,13 @@ function Invoke-QqWheel {
   #>
   param([Parameter(Mandatory = $true)]$Ctx, [int]$Notches = 2, [int]$SettleMs = 700)
   if ($Notches -eq 0) { return 0 }
-  if (-not ('WxWheel' -as [type])) { throw 'WxWheel 类型没定义（maacap.ps1 要先点源）' }
-  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  $script:QqWheelObstructed = $false
+  # 2026-11-04：滚轮不抢焦点（Windows 把它发给光标下的窗口）。安全由 Invoke-TargetWindowWheel
+  #   的"落点是否归 QQ"判断保证：被别的窗口盖住就抛 INPUT_TARGET_LOST，不会滚到别人身上。
   $pt = Get-QqListScreenPoint -Ctx $Ctx
-  $saved = $null
-  try { $saved = [System.Windows.Forms.Cursor]::Position } catch { $saved = $null }
-  # 移动光标到列表上
-  [void][WxNative]::SetCursorPos($pt.x, $pt.y)
-  Start-Sleep -Milliseconds 250
-  $delta = if ($Notches -gt 0) { -120 } else { 120 }
-  $times = [Math]::Abs($Notches)
-  [WxWheel]::Turn($delta, $times)
-  Start-Sleep -Milliseconds $SettleMs
-  if ($saved) { [void][WxNative]::SetCursorPos($saved.X, $saved.Y) }
-  return $Notches
+  $actual = Invoke-TargetWindowWheel -Hwnd $Ctx.win.hwnd -X $pt.x -Y $pt.y -Notches (-$Notches) -StepDelayMs 60
+  if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
+  return (-$actual)
 }
 function Get-QqRowsAuto {
   <#
@@ -463,24 +564,8 @@ function Enable-QqFocus {
   return ([WxNative]::GetForegroundWindow() -eq $h)
 }
 function Get-QqChatScreenPoint {
-  <#
-    .SYNOPSIS  聊天区中心对应的**屏幕坐标**（滚轮要真实光标位置）
-    .DESCRIPTION
-      为什么不能用列表那套坐标：会话列表在左（sessionXFrom~To），聊天正文在右（chatXFrom~chatXTo）。
-      滚轮作用于**光标下的窗口区域**，在列表上滚只会翻列表、不会翻聊天记录。
-      取 x = 聊天区中点、y = 抓图高度的 60%（在头部栏之下、正文之中）。
-  #>
   param([Parameter(Mandatory = $true)]$Ctx)
-  $win = $Ctx.win
-  $cfg = $Ctx.cfg
-  $xFrom = if ($cfg.PSObject.Properties['chatXFrom']) { [double]$cfg.chatXFrom } else { 0.28 }
-  $xTo = if ($cfg.PSObject.Properties['chatXTo']) { [double]$cfg.chatXTo } else { 0.78 }
-  $yAt = if ($cfg.PSObject.Properties['chatYFrom']) { [double]$cfg.chatYFrom } else { 0.3 }
-  $sx = $win.w / [double]$Ctx.captureW
-  $sy = $win.h / [double]$Ctx.captureH
-  $px = [int]($win.x + ($Ctx.captureW * (($xFrom + $xTo) / 2.0)) * $sx)
-  $py = [int]($win.y + ($Ctx.captureH * ($yAt + (1.0 - $yAt) * 0.55)) * $sy)
-  return [pscustomobject]@{ x = $px; y = $py }
+  return (Get-QqWheelScreenPoint -Ctx $Ctx -Area 'chat')
 }
 
 function Invoke-QqChatWheel {
@@ -490,17 +575,9 @@ function Invoke-QqChatWheel {
   #>
   param([Parameter(Mandatory = $true)]$Ctx, [int]$Notches = 2, [int]$SettleMs = 700)
   if ($Notches -eq 0) { return 0 }
-  if (-not ('WxWheel' -as [type])) { throw 'WxWheel 类型没定义（maacap.ps1 要先点源）' }
-  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  $script:QqWheelObstructed = $false
   $pt = Get-QqChatScreenPoint -Ctx $Ctx
-  $saved = $null
-  try { $saved = [System.Windows.Forms.Cursor]::Position } catch { $saved = $null }
-  [void][WxNative]::SetCursorPos($pt.x, $pt.y)
-  Start-Sleep -Milliseconds 250
-  $delta = if ($Notches -gt 0) { -120 } else { 120 }
-  $times = [Math]::Abs($Notches)
-  [WxWheel]::Turn($delta, $times)
-  Start-Sleep -Milliseconds $SettleMs
-  if ($saved) { [void][WxNative]::SetCursorPos($saved.X, $saved.Y) }
-  return $Notches
+  $actual = Invoke-TargetWindowWheel -Hwnd $Ctx.win.hwnd -X $pt.x -Y $pt.y -Notches (-$Notches) -StepDelayMs 60
+  if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
+  return (-$actual)
 }

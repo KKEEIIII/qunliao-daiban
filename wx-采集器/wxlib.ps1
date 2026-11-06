@@ -19,6 +19,7 @@ public class WxNative {
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
   [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int idx, int val);
   [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint crKey, byte alpha, uint flags);
+  [DllImport("user32.dll")] public static extern bool GetLayeredWindowAttributes(IntPtr h, out uint crKey, out byte alpha, out uint flags);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -29,6 +30,17 @@ public class WxNative {
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  public static bool IsValidWindow(IntPtr h) { uint pid; return h != IntPtr.Zero && GetWindowThreadProcessId(h, out pid) != 0; }
+  // 2026-10-29：DPI 相关（125%/150% 缩放下坐标必须统一到物理像素，见下方说明）
+  [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+  [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
+  // ⚠️ GetThreadDpiAwarenessContext 返回的是**不透明句柄**（本机实测 = 34），
+  //   不能直接和 -4/-3/-2 这些预定义值比较；必须先换算成级别
+  //   （0=UNAWARE 1=SYSTEM_AWARE 2=PER_MONITOR_AWARE）。这是 2026-10-29 实测踩到的。
+  [DllImport("user32.dll")] public static extern int GetAwarenessFromDpiAwarenessContext(IntPtr ctx);
+  [DllImport("user32.dll")] public static extern int GetDpiForWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();   // 老系统（< Win10 1703）兜底
   public struct RECT { public int L, T, R, B; }
   public struct POINT { public int X; public int Y; }
 
@@ -66,10 +78,32 @@ public class WxNative {
     return new int[] { r.L, r.T, r.R - r.L, r.B - r.T }; }
 
   public static bool IsMin(IntPtr h) { return IsIconic(h); }
-  public static IntPtr TopAt(int x, int y) {
-    POINT p; p.X = x; p.Y = y;
-    return GetAncestor(WindowFromPoint(p), 2);   // GA_ROOT
+  public static IntPtr RootWindow(IntPtr h) { return IsValidWindow(h) ? GetAncestor(h, 2) : IntPtr.Zero; }
+  public static bool SameRootWindow(IntPtr a, IntPtr b) {
+    if (!IsValidWindow(a) || !IsValidWindow(b)) return false;
+    IntPtr ar = RootWindow(a), br = RootWindow(b);
+    return ar != IntPtr.Zero && br != IntPtr.Zero && ar == br;
   }
+  public static IntPtr ForegroundRoot() { return RootWindow(GetForegroundWindow()); }
+  public static bool ForegroundMatches(IntPtr h) { return IsWechatMainWindow(h) && SameRootWindow(GetForegroundWindow(), h); }
+  public static bool IsWechatMainWindow(IntPtr h) {
+    if (!IsValidWindow(h) || RootWindow(h) != h) return false;
+    uint pid; if (GetWindowThreadProcessId(h, out pid) == 0) return false;
+    try { string n = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; if (n != "Weixin" && n != "WeChat") return false; } catch { return false; }
+    var c = new StringBuilder(256); var t = new StringBuilder(512);
+    GetClassNameW(h, c, c.Capacity); GetWindowTextW(h, t, t.Capacity);
+    return c.ToString() == "Qt51514QWindowIcon" && t.ToString().StartsWith("微信");
+  }
+  public static IntPtr PointRoot(int x, int y) { return RootWindow(WindowAt(x, y)); }
+  // 2026-11-06：遮挡时"临时置顶 → 滚一下 → 复原 z 序"要用到这两个。
+  //   IsTopmost 读 GWL_EXSTYLE 的 WS_EX_TOPMOST(0x8)；ZPrev 取 z 序里紧挨在上面的窗口，
+  //   复原时用 SetWindowPos(hwnd, prevZ, ...) 把窗口放回它下面。
+  public static bool IsTopmost(IntPtr h) { return h != IntPtr.Zero && (GetWindowLong(h, -20) & 0x8) != 0; }
+  public static IntPtr ZPrev(IntPtr h) { return h == IntPtr.Zero ? IntPtr.Zero : GetWindow(h, 3); }
+  public static IntPtr WindowAt(int x, int y) {
+    POINT p; p.X = x; p.Y = y; return WindowFromPoint(p);
+  }
+  public static IntPtr TopAt(int x, int y) { return RootWindow(WindowAt(x, y)); }
   public static void Click(int x, int y) {
     SetCursorPos(x, y);
     System.Threading.Thread.Sleep(60);
@@ -99,6 +133,86 @@ public class WxInput {
 '@
 }
 
+# ============ DPI 感知：把坐标统一到"物理像素"（2026-10-29）============
+#
+# 为什么必须有（证据与推导见 发布\实测报告-2026-10-29\维修报告-DPI缩放坐标错乱.md）：
+#   本库以前从不声明 DPI 感知，于是在 125%/150% 缩放时 GetWindowRect 返回的是**虚拟坐标**
+#   （实测 150%：物理约 1206x1538 的窗口被报成 804x1025），而另外两套坐标是物理的：
+#     · PrintWindow 永远按窗口**物理像素**渲染 → 按虚拟尺寸建位图 = 内容被裁掉右下角；
+#     · SetCursorPos / mouse_event 吃**物理**屏幕坐标 → 用虚拟坐标算出的点会落到窗口外
+#       （实测：算出的 (663,155) 在微信左边界 693 之外，点在了别的程序上）；
+#     · Maa 的 PostClick 吃**客户区**坐标（2026-10-27 实测：不能再乘抓图比例）。
+#   三套坐标混用，**只在 100% 缩放时数值恰好相等**，所以"我本机能跑、别人机器上全残"。
+#
+# 做法：把本线程切到 PER_MONITOR_AWARE_V2，让 GetWindowRect 直接返回物理像素。
+#   这样截图尺寸、OCR 坐标、点击坐标自动同空间，**所有现有公式一行都不用改**；
+#   100% 缩放下这些调用全是 no-op（回归风险几乎为零）。
+#   ⚠️ 用线程级而不是进程级：PowerShell / wscript 宿主可能已声明过感知，
+#      SetProcessDpiAwarenessContext 在这种情况下会失败（实测），线程级调用总是成功。
+$script:WxDpiAware = $false
+$script:WxDpiNote = '未初始化'
+try {
+  [void][WxNative]::SetThreadDpiAwarenessContext([IntPtr](-4))    # -4 = PER_MONITOR_AWARE_V2
+  # ⚠️ 不能拿 GetThreadDpiAwarenessContext 的返回值直接和 -4/-3/-2 比 —— 它是**不透明句柄**
+  #   （本机实测为 34，2026-10-29）。必须用 GetAwarenessFromDpiAwarenessContext 换算：
+  #   0=UNAWARE（虚拟坐标）1=SYSTEM_AWARE 2=PER_MONITOR_AWARE（后两者都是物理坐标）。
+  $hCtx = [WxNative]::GetThreadDpiAwarenessContext()
+  $script:WxDpiLevel = [WxNative]::GetAwarenessFromDpiAwarenessContext($hCtx)
+  $script:WxDpiAware = ($script:WxDpiLevel -ge 1)
+  $script:WxDpiNote = ('级别={0}（0=不感知 1=系统 2=每显示器）' -f $script:WxDpiLevel)
+} catch {
+  try {
+    [void][WxNative]::SetProcessDPIAware()                        # Win10 1703 之前的兜底
+    $script:WxDpiAware = $true
+    $script:WxDpiNote = '进程级（老系统兜底）'
+  } catch {
+    $script:WxDpiAware = $false
+    $script:WxDpiNote = '声明失败：' + $_.Exception.Message
+  }
+}
+
+# 纯计算：把一个"可能是虚拟坐标"的窗口矩形按窗口 DPI 换算成物理像素。
+# 抽成独立函数只为了能单测（测试-DPI坐标.ps1 直接用 150% 的真实数字喂它）。
+# -Aware = $true 时原样返回（感知生效时 GetWindowRect 已经是物理值）。
+function Convert-WxRectByDpi {
+  param(
+    [Parameter(Mandatory = $true)][int[]]$Rect,   # @(left, top, width, height)
+    [int]$Dpi = 96,
+    [bool]$Aware = $true
+  )
+  $f = 1.0
+  if (-not $Aware -and $Dpi -gt 96) { $f = [double]$Dpi / 96.0 }
+  if ($f -eq 1.0) {
+    return [pscustomobject]@{
+      left = $Rect[0]; top = $Rect[1]; width = $Rect[2]; height = $Rect[3]
+      factor = 1.0; corrected = $false
+    }
+  }
+  return [pscustomobject]@{
+    left = [int][Math]::Round($Rect[0] * $f)
+    top = [int][Math]::Round($Rect[1] * $f)
+    width = [int][Math]::Round($Rect[2] * $f)
+    height = [int][Math]::Round($Rect[3] * $f)
+    factor = $f; corrected = $true
+  }
+}
+
+# 取窗口矩形，并**保证拿到的是物理像素**。
+# 正常情况下是 GetWindowRect 原值（上面的感知已生效）；万一感知没生效
+# （宿主线程已固定、或调用方另起线程），按窗口 DPI 再校正一次 ——
+# 否则 PrintWindow 按物理像素画、我们按虚拟尺寸建位图，画面会被裁掉右下角。
+function Get-WxPhysicalRect {
+  param([Parameter(Mandatory = $true)][IntPtr]$Hwnd)
+  $r = [WxNative]::RectOf($Hwnd)
+  $dpi = 0
+  try { $dpi = [WxNative]::GetDpiForWindow($Hwnd) } catch { }
+  $p = Convert-WxRectByDpi -Rect $r -Dpi $dpi -Aware ([bool]$script:WxDpiAware)
+  return [pscustomobject]@{
+    left = $p.left; top = $p.top; width = $p.width; height = $p.height
+    factor = $p.factor; corrected = $p.corrected; dpi = $dpi
+  }
+}
+
 # ============ 抓图（PrintWindow，含 alpha 修正与放大） ============
 function Save-WxWindowShot {
   param(
@@ -106,8 +220,10 @@ function Save-WxWindowShot {
     [Parameter(Mandatory = $true)][string]$Path,
     [int]$Scale = 2
   )
-  $r = [WxNative]::RectOf($Hwnd)
-  $w = $r[2]; $h = $r[3]
+  # 2026-10-29：用**物理像素**矩形建位图 —— PrintWindow 是按窗口物理像素渲染的，
+  #   以前用 GetWindowRect（125%/150% 下是虚拟值）建位图会把内容裁掉右下角。
+  $rp = Get-WxPhysicalRect -Hwnd $Hwnd
+  $w = $rp.width; $h = $rp.height
   if ($w -le 0 -or $h -le 0) { throw "窗口尺寸异常：${w}x${h}" }
 
   $raw = New-Object System.Drawing.Bitmap($w, $h)
@@ -136,11 +252,305 @@ function Save-WxWindowShot {
     scale  = $Scale
     winW   = $w
     winH   = $h
-    left   = $r[0]
-    top    = $r[1]
+    left   = $rp.left
+    top    = $rp.top
   }
   $out.Dispose()
   return $info
+}
+
+# ============ 单行裁剪复读（点击前确认目标行，2026-11-06） ============
+# 为什么需要：整窗 OCR 会把相邻两行并成一行、把「212」读成「21」、把群名读成乱码，
+#   而点击一旦落到错行就会打开错的会话（历史上真的发生过）。
+#   做法：只把候选行的名字区域裁出来、放大 3×/4× 各读一遍，**两档都认出同一目标**才允许点击。
+function Get-WxRowCropRect {
+  <#
+    .SYNOPSIS  候选会话行在窗口像素里的裁剪矩形（纯计算，不读图）
+    .DESCRIPTION
+      x 用名字列的比例边界（默认 0.145~0.42W），y 取名字行基线上下各留 Pad 像素。
+      尺寸过小（窗口异常/行高为 0）时 valid=false，调用方必须 fail-closed。
+  #>
+  param(
+    [Parameter(Mandatory = $true)]$Win,
+    [Parameter(Mandatory = $true)]$Row,
+    [double]$XFrom = 0.145,
+    [double]$XTo = 0.42,
+    [int]$XToPx = 0,
+    [int]$Pad = 6
+  )
+  $baseY = if ($Row.PSObject.Properties['nameY'] -and $Row.nameY -gt 0) { [int]$Row.nameY } else { [int]$Row.y }
+  $nameH = if ($Row.PSObject.Properties['nameH'] -and $Row.nameH -gt 0) { [int]$Row.nameH } else { 18 }
+  # 横向优先用「这一行自己的 OCR 范围」：名字列起点随 DPI/字号漂移，
+  #   固定比例容易把名字左边切掉（实测 0.145W=162，而名字实际从 x≈150 起）。
+  #   ⚠️ 行的 w 是「最宽单个字宽」（见 Invoke-WxOcr），整行右边界要用 x2。
+  $nameX = if ($Row.PSObject.Properties['nameX']) { [int]$Row.nameX } else { 0 }
+  $nameX2 = if ($Row.PSObject.Properties['nameX2']) { [int]$Row.nameX2 } else { 0 }
+  $rowX = if ($nameX -gt 0) { $nameX } elseif ($Row.PSObject.Properties['x']) { [int]$Row.x } else { 0 }
+  $rowX2 = if ($nameX -gt 0 -and $nameX2 -gt $nameX) { $nameX2 } elseif ($Row.PSObject.Properties['x2']) { [int]$Row.x2 } else { 0 }
+  if ($rowX -gt 0 -and $rowX2 -gt $rowX) {
+    $x0 = $rowX - 6
+    $x1 = $rowX2 + 6
+    if ($XToPx -gt 0 -and $x1 -gt $XToPx) { $x1 = $XToPx }
+  } else {
+    $x0 = [int][Math]::Floor([double]$Win.width * $XFrom)
+    # 右边界默认取比例，但调用方通常应传「列表/聊天分界线 - 边距」的像素值：
+    #   分界线常比 0.42W 略靠左，直接用比例会把聊天正文一起裁进来 → 复读结果被污染。
+    $x1 = if ($XToPx -gt 0) { $XToPx } else { [int][Math]::Ceiling([double]$Win.width * $XTo) }
+  }
+  $y0 = $baseY - $Pad
+  $y1 = $baseY + [Math]::Max($nameH, 18) + $Pad
+  if ($x0 -lt 0) { $x0 = 0 }
+  if ($y0 -lt 0) { $y0 = 0 }
+  if ($x1 -gt [int]$Win.width) { $x1 = [int]$Win.width }
+  if ($y1 -gt [int]$Win.height) { $y1 = [int]$Win.height }
+  $w = $x1 - $x0
+  $h = $y1 - $y0
+  return [pscustomobject]@{
+    x = $x0; y = $y0; w = $w; h = $h
+    valid = ($w -ge 24 -and $h -ge 12)
+    baseY = $baseY; nameH = $nameH
+  }
+}
+
+function Save-WxRegionShot {
+  <#
+    .SYNOPSIS  从窗口当前画面裁一块区域，放大后存成 PNG（坐标是窗口像素）
+  #>
+  param(
+    [Parameter(Mandatory = $true)][IntPtr]$Hwnd,
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][int]$X,
+    [Parameter(Mandatory = $true)][int]$Y,
+    [Parameter(Mandatory = $true)][int]$W,
+    [Parameter(Mandatory = $true)][int]$H,
+    [int]$Scale = 3
+  )
+  if ($W -le 0 -or $H -le 0) { throw "裁剪区域无效：${W}x${H}" }
+  $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('wxregion-{0}.png' -f [guid]::NewGuid().ToString('N'))
+  try {
+    $null = Save-WxWindowShot -Hwnd $Hwnd -Path $tmp -Scale 1
+    $src = [System.Drawing.Bitmap]::FromFile($tmp)
+    try {
+      $cx = [Math]::Min([Math]::Max(0, $X), [Math]::Max(0, $src.Width - 1))
+      $cy = [Math]::Min([Math]::Max(0, $Y), [Math]::Max(0, $src.Height - 1))
+      $cw = [Math]::Min($W, $src.Width - $cx)
+      $ch = [Math]::Min($H, $src.Height - $cy)
+      if ($cw -le 0 -or $ch -le 0) { throw '裁剪区域超出窗口' }
+      $rect = New-Object System.Drawing.Rectangle($cx, $cy, $cw, $ch)
+      $crop = $src.Clone($rect, $src.PixelFormat)
+    } finally { $src.Dispose() }
+    try {
+      $outW = [int]($cw * $Scale); $outH = [int]($ch * $Scale)
+      $big = New-Object System.Drawing.Bitmap($outW, $outH)
+      $g = [System.Drawing.Graphics]::FromImage($big)
+      $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+      $g.DrawImage($crop, 0, 0, $outW, $outH)
+      $g.Dispose()
+      $big.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+      $big.Dispose()
+    } finally { $crop.Dispose() }
+    return [pscustomobject]@{ path = $Path; width = $outW; height = $outH; scale = $Scale }
+  } finally {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Test-WxRowTextMatchesExpected {
+  <#
+    .SYNOPSIS  复读文本与预期群名是否算同一行（容忍"名字 + 右侧时间/角标"被读成一行）
+    .DESCRIPTION
+      截图里时间在名字右边同一基线上，OCR 常把它并进名字里（实测
+      「26 示例群A 2 班 266…」后面跟着「10/31」和一个未读角标）。
+      所以：只有当多出来的尾巴是纯数字/时间符号时才放过；像「DeepSeek」↔「DeepSeek AI」
+      这种尾巴带字母的**必须拒绝**（它们是两个不同的会话，配置注释里明确警告过）。
+  #>
+  param([string]$Text, [string]$Expected)
+  if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
+  # 归一化口径与 Get-ChatMatchInfo 一致（去空白 + 去标点/括号），
+  #   否则「．“」与「."」这类全半角差异会把同一个群判成不同（实测踩过）。
+  $clean = { param($s) (([string]$s) -replace '\s', '' -replace '[：:，。、．（）()【】\[\]“”"''·]', '') }
+  $nt = & $clean $Text
+  $ne = & $clean $Expected
+  if ($nt.Length -lt 2 -or $ne.Length -lt 2) { return $false }
+  if ($nt -eq $ne) { return $true }
+  # 裁剪区左侧可能带进一点面板碎屑（实测读成「、，」），去掉再比
+  $nt = $nt -replace '^[^\p{L}\p{N}]+', ''
+  if ($nt -eq $ne) { return $true }
+  if ($nt.Length -gt $ne.Length -and $nt.StartsWith($ne)) {
+    # 只容忍"名字 + 右侧时间/角标"：尾巴必须是数字或时间符号；
+    #   角标 0/1 常被 OCR 读成字母 O/I/l（实测「10 / 31 / O」），一并放过。
+    $tail = $nt.Substring($ne.Length)
+    if ($tail -match '^[\d:/\-OoIl]{1,12}$') { return $true }
+  }
+  $mi = Get-ChatMatchInfo -A $Text -B $Expected -Whitelist @()
+  return [bool]$mi.same
+}
+
+function Test-WxRowConfirmation {
+  <#
+    .SYNOPSIS  点击前的目标行确认：裁行 + 多档放大 OCR，全部档位都认出预期名字才算通过
+    .OUTPUTS   @{ ok; reason; passes=@(每档识别文本); rect }
+    .DESCRIPTION
+      判定规则刻意保守（fail-closed）：默认两档（3×、4×）都要成功识别；
+      只要有一档读不出或读成别的名字，就 ok=false → 调用方应跳过该会话而不是冒险点击。
+      代价是 OCR 抖动时会少点几个群（下一轮还能补），好过点开错误的群。
+  #>
+  param(
+    [Parameter(Mandatory = $true)]$Win,
+    [Parameter(Mandatory = $true)]$Row,
+    [Parameter(Mandatory = $true)][string]$Expected,
+    [double]$XFrom = 0.145,
+    [double]$XTo = 0.42,
+    [int]$XToPx = 0,
+    [int[]]$Scales = @(3, 4)
+  )
+  $rect = Get-WxRowCropRect -Win $Win -Row $Row -XFrom $XFrom -XTo $XTo -XToPx $XToPx
+  if (-not $rect.valid) {
+    return [pscustomobject]@{ ok = $false; reason = ('裁剪区域无效 {0}x{1}' -f $rect.w, $rect.h); passes = @(); rect = $rect }
+  }
+  $passes = @()
+  $matched = 0
+  foreach ($s in $Scales) {
+    $p = Join-Path ([System.IO.Path]::GetTempPath()) ('wxrow-{0}-x{1}.png' -f [guid]::NewGuid().ToString('N'), $s)
+    try {
+      $null = Save-WxRegionShot -Hwnd $Win.hwnd -Path $p -X $rect.x -Y $rect.y -W $rect.w -H $rect.h -Scale $s
+      $text = (@(Invoke-WxOcr -Path $p -Scale 1) | ForEach-Object { $_.text }) -join ''
+      $text = [string]$text
+      $passes += $text
+      if (-not [string]::IsNullOrWhiteSpace($text)) {
+        # 用「列表行名」那套容错匹配（长名共同前缀 / 数字前缀）+ 尾部时间容忍，
+        #   而不是点开后的严格身份：整窗 OCR 的行名本来就带噪声。
+        if (Test-WxRowTextMatchesExpected -Text $text -Expected $Expected) { $matched++ }
+      }
+    } catch {
+      $passes += ''
+    } finally {
+      Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    }
+  }
+  $need = [Math]::Max(2, $Scales.Count)
+  $ok = ($passes.Count -ge 1 -and $matched -ge $need -and $matched -eq $passes.Count)
+  $reason = if ($ok) { '两档 OCR 一致' } else { ('复读未确认（{0}/{1} 档匹配，{2} 档识别）' -f $matched, $need, @($passes | Where-Object { $_ }).Count) }
+  return [pscustomobject]@{ ok = $ok; reason = $reason; passes = $passes; rect = $rect }
+}
+
+# ============ 会话列表是否被滚离顶部（2026-11-06） ============
+# 为什么需要：采集器**不会滚动会话列表**，只认当前可见的那几行。用户手动把列表往下滚过之后，
+#   视野外的群就等于"不存在"——它们有新消息也采不到（实测：13:27 有 7 个置顶群，13:57 只剩 3 个可见，
+#   另外几个只是滚出了视野）。所以每轮采集前先判断列表有没有被滚走，必要时滚回顶部。
+function Get-WxChatListClipInfo {
+  <#
+    .SYNOPSIS  从 OCR 行判断「列表顶行是不是被视口切掉」（= 列表被滚离了顶部）
+    .DESCRIPTION
+      标定依据（本机 1118x809 实测）：
+        · 在顶部时，顶行是完整的一行，OCR 行高 16；
+        · 滚离顶部时，顶行被视口边缘切断，OCR 行高只有 8、文字也读成碎屑（"乙》乙"）。
+      所以判据是**相对**的：顶行高 < 其余行中位高 × 0.85 → 认为被切。
+      （阈值标定：被切实测 8/13=0.61、10/14=0.71；在顶部实测 16/13=1.23。
+        取 0.85 是为了宁可误报——误报只是在顶部多滚几下（无效动作），漏报才是漏采。）
+      绝对 y 不能用来判断（两种状态顶行的 y 都是 100，差不出区别）。
+    .OUTPUTS   @{ known; clipped; topH; medianH; count; topText; reason }
+  #>
+  param(
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
+    [Parameter(Mandatory = $true)][double]$WinW,
+    [Parameter(Mandatory = $true)][double]$WinH,
+    [double]$XFrom = 0.10,
+    [double]$XTo = 0.37,
+    [double]$ListTopRatio = 0.10,
+    [double]$Ratio = 0.85
+  )
+  $x0 = [int]($WinW * $XFrom); $x1 = [int]($WinW * $XTo); $y0 = [int]($WinH * $ListTopRatio)
+  $sel = @($Rows | Where-Object {
+      $_ -and $_.x -ge $x0 -and $_.x -lt $x1 -and $_.y -ge $y0 -and ([string]$_.text).Trim().Length -ge 1
+    } | Sort-Object y)
+  if ($sel.Count -lt 3) {
+    return [pscustomobject]@{ known = $false; clipped = $false; topH = 0; medianH = 0; count = $sel.Count; topText = ''; reason = '列表可读行太少，无法判断' }
+  }
+  $topH = [int]$sel[0].h
+  $hs = @($sel | Select-Object -Skip 1 | ForEach-Object { [int]$_.h } | Sort-Object)
+  $medianH = [int]$hs[[int](($hs.Count - 1) / 2)]
+  $clipped = ($medianH -ge 10 -and $topH -gt 0 -and $topH -lt ($medianH * $Ratio))
+  $reason = if ($clipped) { ('顶行被切（h={0} vs 常规 {1}）' -f $topH, $medianH) } else { ('顶行完整（h={0} / 常规 {1}）' -f $topH, $medianH) }
+  return [pscustomobject]@{ known = $true; clipped = $clipped; topH = $topH; medianH = $medianH; count = $sel.Count; topText = [string]$sel[0].text; reason = $reason }
+}
+
+function Invoke-WxChatListReset {
+  <#
+    .SYNOPSIS  把会话列表滚回顶部（只在检测到"顶行被切"时才动）
+    .DESCRIPTION
+      ⚠️ 必须用**真实滚轮**：微信只认真实 WM_MOUSEWHEEL（合成消息它不理），
+      所以调用前窗口必须是可见/可接收输入的。伪最小化时窗口带 WS_EX_TRANSPARENT（点击穿透），
+      落点会被下发到后面的窗口 —— `Invoke-TargetWindowWheel` 会拒绝，这里也会安全返回 moved=false。
+    .OUTPUTS   @{ moved; steps; notches; clippedBefore; clippedAfter; before; after }
+  #>
+  param(
+    [Parameter(Mandatory = $true)]$Win,
+    [int]$StepNotches = 3,
+    [int]$MaxSteps = 3,
+    [int]$StepDelayMs = 260,
+    [switch]$AutoFocus
+  )
+  $hwnd = $Win.hwnd
+  $shot = Join-Path ([System.IO.Path]::GetTempPath()) ('wxlist-{0}.png' -f [guid]::NewGuid().ToString('N'))
+  $prevFg = [IntPtr]::Zero; $focusedByUs = $false
+  $measure = {
+    param($path)
+    $null = Save-WxWindowShot -Hwnd $hwnd -Path $path -Scale 1
+    $rows = @(Invoke-WxOcr -Path $path -Scale 1)
+    Get-WxChatListClipInfo -Rows $rows -WinW ([double]$Win.width) -WinH ([double]$Win.height)
+  }
+  try {
+    $before = & $measure $shot
+    if ($before.known -and -not $before.clipped) {
+      return [pscustomobject]@{ moved = $false; steps = 0; notches = 0; method = 'geometry'; clippedBefore = $false; clippedAfter = $false; before = $before; after = $before }
+    }
+    # 确实需要归位（或几何判不出来）时才动前台：真实滚轮要求落点归目标窗口，被别的窗口盖住会被守卫拒绝。
+    # 滚完立刻把前台还给原来的窗口，不长期抢焦点。
+    if ($AutoFocus -and -not [WxNative]::ForegroundMatches($hwnd)) {
+      $prevFg = [WxNative]::GetForegroundWindow()
+      [void](Set-WxForeground -Hwnd $hwnd)
+      Start-Sleep -Milliseconds 500
+      $focusedByUs = $true
+    }
+    $sx = [int]($Win.left + $Win.width * 0.20)
+    $sy = [int]($Win.top + $Win.height * 0.45)
+    # 2026-11-06：**几何判据判不出来时**（列表可读行太少），退回"内容签名法"：
+    #   一路向上滚，直到 OCR 文本不再变化（= 到顶）。QQ 那边一直用这个，稳但不依赖版式特征。
+    if (-not $before.known) {
+      $prevSig = ''; $sigRounds = 0; $sigNotches = 0
+      while ($sigRounds -lt $MaxSteps) {
+        $null = Save-WxWindowShot -Hwnd $hwnd -Path $shot -Scale 1
+        $sigRows = @(Invoke-WxOcr -Path $shot -Scale 1)
+        $curSig = (@($sigRows | Where-Object {
+              $_.x -ge [int]($Win.width * 0.10) -and $_.x -lt [int]($Win.width * 0.37) -and
+              -not [string]::IsNullOrWhiteSpace([string]$_.text)
+            } | Sort-Object y | ForEach-Object { [string]$_.text }) -join '|')
+        if ($sigRounds -gt 0 -and $curSig -eq $prevSig) { break }
+        $prevSig = $curSig
+        $null = Invoke-TargetWindowWheel -Hwnd $hwnd -X $sx -Y $sy -Notches $StepNotches -StepDelayMs 60 -RequireWechat
+        $sigNotches += $StepNotches
+        $sigRounds++
+        Start-Sleep -Milliseconds $StepDelayMs
+      }
+      return [pscustomobject]@{ moved = ($sigRounds -gt 0); steps = $sigRounds; notches = $sigNotches; method = 'signature'; clippedBefore = $false; clippedAfter = $false; before = $before; after = $before }
+    }
+    $steps = 0; $notches = 0; $after = $before
+    while ($steps -lt $MaxSteps) {
+      $null = Invoke-TargetWindowWheel -Hwnd $hwnd -X $sx -Y $sy -Notches $StepNotches -StepDelayMs 60 -RequireWechat
+      $notches += $StepNotches
+      $steps++
+      Start-Sleep -Milliseconds $StepDelayMs
+      $after = & $measure $shot
+      if (-not $after.known -or -not $after.clipped) { break }
+    }
+    return [pscustomobject]@{ moved = $true; steps = $steps; notches = $notches; method = 'geometry'; clippedBefore = $true; clippedAfter = [bool]$after.clipped; before = $before; after = $after }
+  } finally {
+    if ($focusedByUs -and $prevFg -ne [IntPtr]::Zero) {
+      try { [void][WxNative]::SetForegroundWindow($prevFg) } catch { }
+    }
+    Remove-Item -LiteralPath $shot -Force -ErrorAction SilentlyContinue
+  }
 }
 
 # ============ 内置 OCR（WinRT） ============
@@ -197,10 +607,11 @@ function Invoke-WxOcr {
   $rows = @()
   $div = if ($Scale -gt 1) { [double]$Scale } else { 1.0 }
   foreach ($line in $result.Lines) {
-    $xs = @(); $ys = @(); $hs = @(); $ws = @()
+    $xs = @(); $ys = @(); $hs = @(); $ws = @(); $x2s = @()
     foreach ($word in $line.Words) {
       $r = $word.BoundingRect
       $xs += [double]$r.X; $ys += [double]$r.Y; $hs += [double]$r.Height; $ws += [double]$r.Width
+      $x2s += ([double]$r.X + [double]$r.Width)
     }
     $rows += [pscustomobject]@{
       text = $line.Text
@@ -211,30 +622,60 @@ function Invoke-WxOcr {
       x    = [int]([Math]::Round((($xs | Measure-Object -Minimum).Minimum) / $div))
       y    = [int]([Math]::Round((($ys | Measure-Object -Minimum).Minimum) / $div))
       h    = [int]([Math]::Round((($hs | Measure-Object -Maximum).Maximum) / $div))
+      # w 历史上是「最宽单个字宽」；x2 是整行真实右边界（2026-11-06 加，单行裁剪需要它）。
       w    = [int]([Math]::Round((($ws | Measure-Object -Maximum).Maximum) / $div))
+      x2   = [int]([Math]::Round((($x2s | Measure-Object -Maximum).Maximum) / $div))
     }
   }
   return $rows
 }
 
+function Test-WxTargetWindowIdentity {
+  param([IntPtr]$Hwnd, [switch]$RequireVisible)
+  if (-not [WxNative]::IsValidWindow($Hwnd)) { return [pscustomobject]@{ valid = $false; hwnd = $Hwnd; reason = 'invalid-hwnd' } }
+  $top = [WxNative]::RootWindow($Hwnd)
+  if ($top -eq [IntPtr]::Zero -or $top -ne $Hwnd) { return [pscustomobject]@{ valid = $false; hwnd = $Hwnd; root = $top; reason = 'not-top-level-window' } }
+  $processIdValue = [uint32]0
+  [void][WxNative]::GetWindowThreadProcessId($Hwnd, [ref]$processIdValue)
+  $process = Get-Process -Id ([int]$processIdValue) -ErrorAction SilentlyContinue
+  if (-not $process -or $process.ProcessName -notin @('Weixin','WeChat')) { return [pscustomobject]@{ valid = $false; hwnd = $Hwnd; pid = $processIdValue; process = if($process){$process.ProcessName}else{''}; reason = 'not-wechat-process' } }
+  $classBuffer = New-Object System.Text.StringBuilder 256
+  [void][WxNative]::GetClassNameW($Hwnd, $classBuffer, $classBuffer.Capacity)
+  $titleBuffer = New-Object System.Text.StringBuilder 512
+  [void][WxNative]::GetWindowTextW($Hwnd, $titleBuffer, $titleBuffer.Capacity)
+  $class = $classBuffer.ToString(); $title = $titleBuffer.ToString()
+  if ($class -ne 'Qt51514QWindowIcon' -or -not $title.StartsWith('微信')) { return [pscustomobject]@{ valid = $false; hwnd = $Hwnd; pid = $processIdValue; process = $process.ProcessName; class = $class; title = $title; reason = 'wrong-window-class-or-title' } }
+  $root = [WxNative]::RootWindow($Hwnd)
+  if ($root -eq [IntPtr]::Zero) { return [pscustomobject]@{ valid = $false; hwnd = $Hwnd; pid = $processIdValue; process = $process.ProcessName; class = $class; title = $title; reason = 'missing-root-window' } }
+  if ($RequireVisible -and -not [WxNative]::IsWindowVisible($root)) { return [pscustomobject]@{ valid = $false; hwnd = $Hwnd; root = $root; pid = $processIdValue; process = $process.ProcessName; class = $class; title = $title; reason = 'window-hidden' } }
+  return [pscustomobject]@{ valid = $true; hwnd = $Hwnd; root = $root; pid = $processIdValue; process = $process.ProcessName; class = $class; title = $title; reason = 'wechat-main-window' }
+}
+
 function Get-WxWindowInfo {
   param([IntPtr]$Hwnd = [IntPtr]::Zero)
   $hwnd = if ($Hwnd -ne [IntPtr]::Zero) { $Hwnd } else { [WxNative]::FindMain() }
+  if ($hwnd -ne [IntPtr]::Zero -and -not (Test-WxTargetWindowIdentity -Hwnd $hwnd).valid) { return $null }
   if ($hwnd -eq [IntPtr]::Zero) {
     # 兜底：窗口可能被"收进托盘"（SW_HIDE，可见=False）而不是最小化 —— 老逻辑只认可见窗口，
     # 于是直接报"找不到微信主窗口"。这里把隐藏的也找出来，交给伪最小化去抓。
     $hwnd = Find-WxWindowAny -IncludeHidden
     if ($hwnd -eq [IntPtr]::Zero) { return $null }
   }
-  $r = [WxNative]::RectOf($hwnd)
+  # 2026-10-29：统一返回**物理像素**矩形（125%/150% 下以前的虚拟值会让会话列裁剪边界、
+  #   标题区范围、点击落点全部按错的尺度算 → "识别到的会话变少 / 点开的不是本意群"）。
+  $rp = Get-WxPhysicalRect -Hwnd $hwnd
   return [pscustomobject]@{
     hwnd      = $hwnd
-    left      = $r[0]
-    top       = $r[1]
-    width     = $r[2]
-    height    = $r[3]
+    left      = $rp.left
+    top       = $rp.top
+    width     = $rp.width
+    height    = $rp.height
     minimized = [WxNative]::IsMin($hwnd)
     visible   = [WxNative]::IsWindowVisible($hwnd)
+    dpi       = $rp.dpi
+    dpiAware  = [bool]$script:WxDpiAware
+    dpiFactor = $rp.factor
+    dpiFixed  = $rp.corrected
   }
 }
 
@@ -243,35 +684,282 @@ function Invoke-WxClickAt {
   [WxNative]::Click($X, $Y)
 }
 
+# 真实鼠标点击的竞态保护：共享桌面输入互斥锁，移动后复核目标窗口，按下后总是释放。
+if (-not ('WxGuardedClick' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WxGuardedClick {
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  static bool Valid(IntPtr h) { uint pid; return h!=IntPtr.Zero && GetWindowThreadProcessId(h,out pid)!=0; }
+  static IntPtr Root(IntPtr h) { return !Valid(h) ? IntPtr.Zero : GetAncestor(h,2); }
+  public static bool SameRootWindow(IntPtr a, IntPtr b) { return a!=IntPtr.Zero && b!=IntPtr.Zero && Valid(a) && Valid(b) && Root(a)==Root(b); }
+  static bool IsWechat(IntPtr h) {
+    uint pid; if(!Valid(h) || GetWindowThreadProcessId(h,out pid)==0 || Root(h)!=h) return false;
+    try { string n=System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; if(n!="Weixin" && n!="WeChat") return false; } catch { return false; }
+    var c=new System.Text.StringBuilder(256); var t=new System.Text.StringBuilder(512);
+    GetClassNameW(h,c,c.Capacity); GetWindowTextW(h,t,t.Capacity);
+    return c.ToString()=="Qt51514QWindowIcon" && t.ToString().StartsWith("微信");
+  }
+  public static bool IsWechatWindow(IntPtr h) { return IsWechat(h); }
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+  static bool At(int x, int y) { POINT p; return GetCursorPos(out p) && p.X==x && p.Y==y; }
+
+  static bool SameRoot(IntPtr a, IntPtr b) { return a!=IntPtr.Zero && b!=IntPtr.Zero && Valid(a) && Valid(b) && Root(a)==Root(b); }
+  public static bool ForegroundMatches(IntPtr h) { return IsWechat(h) && SameRoot(GetForegroundWindow(),h); }
+  static bool Owns(IntPtr h, int x, int y) {
+    POINT p; p.X=x; p.Y=y;
+    return IsWechat(h) && SameRoot(GetForegroundWindow(),h) && SameRoot(WindowFromPoint(p),h);
+  }
+  static bool OnPoint(IntPtr h, int x, int y) {
+    POINT p; p.X=x; p.Y=y;
+    return IsWechat(h) && SameRoot(WindowFromPoint(p),h);
+  }
+  public static bool Click(IntPtr h, int x, int y, int settleMs) {
+    using (var m = new System.Threading.Mutex(false, "Local\\QunliaoDaiban-DesktopInput")) {
+      bool locked=false, down=false, ok=false, haveSaved=false; POINT saved=new POINT(), now=new POINT();
+      try {
+        try { locked=m.WaitOne(0); } catch (System.Threading.AbandonedMutexException) { locked=true; }
+        if (!locked) throw new InvalidOperationException("INPUT_BUSY: 另一采集器正在操作鼠标，跳过本次点击");
+        if (!Owns(h,x,y) || !GetCursorPos(out saved)) return false;
+        haveSaved=true;
+        if (!SetCursorPos(x,y) || !At(x,y) || !Owns(h,x,y)) return false;
+        mouse_event(0x0002,0,0,0,UIntPtr.Zero); down=true;
+        System.Threading.Thread.Sleep(Math.Max(0,settleMs));
+        ok=At(x,y) && Owns(h,x,y);
+        return ok;
+      } finally {
+        if (down) mouse_event(0x0004,0,0,0,UIntPtr.Zero);
+        if (haveSaved && GetCursorPos(out now) && now.X==x && now.Y==y && OnPoint(h,x,y)) SetCursorPos(saved.X,saved.Y);
+        if (locked) { try { m.ReleaseMutex(); } catch { } }
+      }
+    }
+  }
+}
+'@
+}
+
+function Invoke-TargetWindowClick {
+  param([Parameter(Mandatory=$true)][IntPtr]$Hwnd,
+    [Parameter(Mandatory=$true)][int]$X, [Parameter(Mandatory=$true)][int]$Y,
+    [int]$SettleMs = 40)
+  $identity = Test-WxTargetWindowIdentity -Hwnd $Hwnd
+  if (-not $identity.valid) { return $false }
+  if (-not [WxNative]::ForegroundMatches($Hwnd)) { return $false }
+  return [WxGuardedClick]::Click($Hwnd,$X,$Y,$SettleMs)
+}
+
+# 每个滚轮事件都检查前台、鼠标位置和命中窗口；用户接管鼠标后立即停止。
+# 不自动抢前台；后台截图成功不代表可以发送全局输入。
+if (-not ('WxGuardedInput' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WxGuardedInput {
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint x, uint y, int data, UIntPtr extra);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  static bool Valid(IntPtr h) { uint pid; return h!=IntPtr.Zero && GetWindowThreadProcessId(h,out pid)!=0; }
+  static IntPtr Root(IntPtr h) { return !Valid(h) ? IntPtr.Zero : GetAncestor(h,2); }
+  static bool SameRoot(IntPtr a, IntPtr b) { return a!=IntPtr.Zero && b!=IntPtr.Zero && Valid(a) && Valid(b) && Root(a)==Root(b); }
+  static bool IsWechat(IntPtr h) {
+    uint pid; if(!Valid(h) || GetWindowThreadProcessId(h,out pid)==0 || Root(h)!=h) return false;
+    try { string n=System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; if(n!="Weixin" && n!="WeChat") return false; } catch { return false; }
+    var c=new System.Text.StringBuilder(256); var t=new System.Text.StringBuilder(512);
+    GetClassNameW(h,c,c.Capacity); GetWindowTextW(h,t,t.Capacity);
+    return c.ToString()=="Qt51514QWindowIcon" && t.ToString().StartsWith("微信");
+  }
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+  public static bool SameRootWindow(IntPtr a, IntPtr b) { return SameRoot(a,b); }
+  public static bool IsWechatWindow(IntPtr h) { return IsWechat(h); }
+  public static bool ForegroundMatches(IntPtr h) { return IsWechat(h) && SameRoot(GetForegroundWindow(),h); }
+  public static bool OwnsPoint(IntPtr h, int x, int y) {
+    POINT p; p.X=x; p.Y=y;
+    // ⚠️ 2026-11-06：这是**通用**守卫（QQ 的滚轮也走这里），不能写死"必须是微信"，
+    //   否则 QQ 一律被判"被遮挡"（实测：QQ 临时置顶后仍报 INPUT_TARGET_LOST）。
+    //   微信专属身份校验放在调用方：Invoke-TargetWindowWheel -RequireWechat / Invoke-TargetWindowClick。
+    return Valid(h) && SameRoot(GetForegroundWindow(),h) && SameRoot(WindowFromPoint(p),h);
+  }
+  // 2026-11-04：滚轮**不需要窗口在前台**。Windows 把 WM_MOUSEWHEEL 发给光标下的窗口，
+  //   这个过程不会激活窗口（不抢焦点）。真正的风险只有一个：落点被别的窗口盖住 → 滚到别人身上。
+  //   所以判据从"是不是前台"改成"这个点是不是归目标窗口"，既安全又能后台滚。
+  public static bool OnPoint(IntPtr h, int x, int y) {
+    POINT p; p.X=x; p.Y=y;
+    return Valid(h) && SameRoot(WindowFromPoint(p),h);
+  }
+  public static bool PositionBg(IntPtr h,int x,int y) { return OnPoint(h,x,y) && SetCursorPos(x,y); }
+  public static bool WheelBg(IntPtr h,int x,int y,int delta) {
+    if(!At(x,y) || !OnPoint(h,x,y)) return false;
+    mouse_event(0x0800,0,0,delta,UIntPtr.Zero); return true;
+  }
+  public static bool At(int x,int y) { POINT p; return GetCursorPos(out p) && p.X==x && p.Y==y; }
+  public static int[] Cursor() { POINT p; if(!GetCursorPos(out p)) throw new InvalidOperationException("Cannot read cursor"); return new int[]{p.X,p.Y}; }
+  public static bool Position(IntPtr h,int x,int y) { return OwnsPoint(h,x,y) && SetCursorPos(x,y); }
+  public static bool Wheel(IntPtr h,int x,int y,int delta) {
+    if(!At(x,y) || !OwnsPoint(h,x,y)) return false;
+    mouse_event(0x0800,0,0,delta,UIntPtr.Zero); return true;
+  }
+  public static void Restore(IntPtr h,int x,int y,int oldX,int oldY) {
+    if(At(x,y) && OnPoint(h,x,y)) SetCursorPos(oldX,oldY);
+  }
+}
+'@
+}
+
+function Invoke-TargetWindowWheel {
+  param([Parameter(Mandatory=$true)][IntPtr]$Hwnd,
+    [Parameter(Mandatory=$true)][int]$X, [Parameter(Mandatory=$true)][int]$Y,
+    [Parameter(Mandatory=$true)][int]$Notches, [int]$StepDelayMs = 70,
+    [int[]]$ExpectedCursor = $null,
+    # 2026-11-06：微信身份校验改成**显式开关**。这个函数是通用滚轮（QQ 也用），
+    #   默认带上"必须是微信主窗"的校验会把 QQ 的滚轮拦成 INPUT_TARGET_LOST（实测踩过）。
+    #   微信的调用点自己传 -RequireWechat。
+    [switch]$RequireWechat)
+  if ($Notches -eq 0) { return 0 }
+  if ($RequireWechat) {
+    $identity = Test-WxTargetWindowIdentity -Hwnd $Hwnd
+    if (-not $identity.valid) { throw ('INPUT_TARGET_LOST: 输入目标不是有效微信主窗口（{0}）' -f $identity.reason) }
+  }
+  $mutex = New-Object System.Threading.Mutex($false, 'Local\QunliaoDaiban-DesktopInput')
+  $locked = $false; $saved = $null
+  try {
+    try { $locked = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
+    if (-not $locked) { throw 'INPUT_BUSY: 另一采集器正在操作鼠标，跳过本次滚动' }
+    if ($ExpectedCursor -and -not (Test-WxHistoryCursorStable -Expected $ExpectedCursor -Actual ([WxGuardedInput]::Cursor()))) {
+      throw 'INPUT_ABORTED: 用户移动鼠标，停止历史滚动'
+    }
+    if (-not [WxNative]::IsValidWindow($Hwnd) -or [WxNative]::RootWindow($Hwnd) -ne $Hwnd) { throw 'INPUT_TARGET_LOST: 目标句柄已失效或不是顶层窗口' }
+    if (-not [WxGuardedInput]::OnPoint($Hwnd,$X,$Y)) { throw 'INPUT_TARGET_LOST: 滚动点不在目标窗口上（被其他窗口遮挡），未发送滚轮' }
+    $saved = [WxGuardedInput]::Cursor()
+    if (-not [WxGuardedInput]::PositionBg($Hwnd,$X,$Y)) { throw 'INPUT_TARGET_LOST: 无法定位目标滚动点' }
+    $delta = if ($Notches -gt 0) { 120 } else { -120 }
+    for ($i=0; $i -lt [Math]::Abs($Notches); $i++) {
+      if (-not [WxGuardedInput]::WheelBg($Hwnd,$X,$Y,$delta)) {
+        throw ('INPUT_ABORTED: 用户移动鼠标或目标被遮挡，停止滚动（已发送 {0} 格）' -f $i)
+      }
+      if ($StepDelayMs -gt 0) { Start-Sleep -Milliseconds $StepDelayMs }
+    }
+    return $Notches
+  } finally {
+    if ($saved) { [WxGuardedInput]::Restore($Hwnd,$X,$Y,$saved[0],$saved[1]) }
+    if ($locked) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
+  }
+}
+
 # ==================== 真实鼠标滚轮（2026-10-18：翻往期聊天记录用） ====================
 #
 # 微信聊天区只响应真实 WM_MOUSEWHEEL；qqread.ps1 那边验证过：Maa 的 PostScroll 对 QQ 全无效，
 # 只有 mouse_event WHEEL 有效。这里把它做成通用函数。
 # ⚠️ dwData 有符号：正 = 向上（看更早），负 = 向下。类的签名是 uint，所以负值 [uint32](-120 -band 0xFFFFFFFF)。
+function Get-WxChatWheelPoints {
+  <# 返回消息面板中部的候选屏幕坐标；列表、标题和底部输入区均不在候选范围内。 #>
+  param([Parameter(Mandatory=$true)]$Win, [Parameter(Mandatory=$true)]$Cfg, [int]$SplitX = 0)
+  $w = [int]$Win.width; $h = [int]$Win.height
+  if ($w -lt 400 -or $h -lt 300) { return @() }
+  $prof = Get-WxLayoutProfile -Win $Win -Cfg $Cfg
+  $split = if ($SplitX -gt 0) { [Math]::Max([int]$prof.splitX,$SplitX) } else { [int]$prof.splitX }
+  $x0 = [int][Math]::Max($split + 32, $w * 0.48)
+  # 采用聊天区中部的保守带，不向最右侧探测（避免成员/工具侧栏）。
+  $x1 = [int][Math]::Min($w * 0.70, $split + ($w - $split) * 0.62)
+  $y0 = [int][Math]::Max([double]$prof.titleY + ($h * 0.08), $h * 0.28)
+  $y1 = [int]($h * 0.70)   # 避开底部输入区
+  if ($x1 -le $x0 + 20 -or $y1 -le $y0 + 20) { return @() }
+  $out = @()
+  foreach ($yf in @(0.30,0.52,0.72)) {
+    foreach ($xf in @(0.25,0.50,0.75)) {
+      $lx = [int][Math]::Round($x0 + ($x1 - $x0) * $xf)
+      $ly = [int][Math]::Round($y0 + ($y1 - $y0) * $yf)
+      $out += [pscustomobject]@{ x = [int]($Win.left + $lx); y = [int]($Win.top + $ly); localX = $lx; localY = $ly }
+    }
+  }
+  return $out
+}
+
+function Test-WxHistoryCursorStable {
+  param([int[]]$Expected, [int[]]$Actual)
+  return ($Expected -and $Actual -and $Expected.Count -ge 2 -and $Actual.Count -ge 2 -and
+    $Expected[0] -eq $Actual[0] -and $Expected[1] -eq $Actual[1])
+}
+
+function Test-WxHistoryPageMatches {
+  param([string]$ExpectedTitle, [string[]]$ExpectedLines, [string]$ActualTitle, [string[]]$ActualLines)
+  if ([string]::IsNullOrWhiteSpace($ExpectedTitle) -or [string]::IsNullOrWhiteSpace($ActualTitle)) { return $false }
+  if (-not (Test-ChatHeaderIdentity -Actual $ActualTitle -Expected $ExpectedTitle)) { return $false }
+  $expected = @($ExpectedLines | ForEach-Object { (([string]$_) -replace '\s', '').ToLowerInvariant() } | Where-Object { $_ })
+  $actual = @($ActualLines | ForEach-Object { (([string]$_) -replace '\s', '').ToLowerInvariant() } | Where-Object { $_ })
+  if ($expected.Count -lt 2 -or $actual.Count -lt 2) { return $false }
+  return (($expected -join "`n") -eq ($actual -join "`n"))
+}
+
 function Invoke-WxWheel {
   param(
-    [Parameter(Mandatory = $true)][int]$Notches,   # 正 = 向上滚（更早的消息），负 = 向下滚
-    [int]$StepDelayMs = 70
+    [Parameter(Mandatory = $true)][int]$Notches,
+    [Parameter(Mandatory = $true)][IntPtr]$Hwnd,
+    [int]$StepDelayMs = 70,
+    $Win = $null, $Cfg = $null, [int]$SplitX = 0, [switch]$HistoryGuard,
+    [int[]]$HistoryCursor = $null
   )
-  if ($Notches -eq 0) { return }
-  $sign = if ($Notches -gt 0) { 1 } else { -1 }
-  # ⚠️ 不要写 [uint32]((120*$sign) -band 0xFFFFFFFF)：PS 5.1 里负数的 -band 结果再转 uint32 会抛
-  #   "Cannot convert value -120 to type UInt32"。用 BitConverter 拿补码，任何值都稳。（2026-10-18 实测）
-  $delta = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int](120 * $sign)), 0)
-  $n = [Math]::Abs($Notches)
-  for ($i = 0; $i -lt $n; $i++) {
-    [WxNative]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)   # MOUSEEVENTF_WHEEL
-    if ($StepDelayMs -gt 0) { Start-Sleep -Milliseconds $StepDelayMs }
+  if ($Notches -eq 0) { return 0 }
+  $rp = Get-WxPhysicalRect -Hwnd $Hwnd
+  if ($rp.width -le 0 -or $rp.height -le 0) { throw 'INPUT_TARGET_LOST: 微信窗口矩形无效' }
+  if ($null -eq $Win) {
+    $Win = [pscustomobject]@{ hwnd = $Hwnd; left = $rp.left; top = $rp.top; width = $rp.width; height = $rp.height; dpi = $rp.dpi }
+  } elseif ($rp.left -ne $Win.left -or $rp.top -ne $Win.top -or $rp.width -ne $Win.width -or $rp.height -ne $Win.height) {
+    throw 'INPUT_TARGET_LOST: 微信窗口矩形在滚动前发生变化'
   }
+  if ($null -eq $Cfg) { $Cfg = [pscustomobject]@{ headerYTo = 0.16; sessionXTo = 0.42 } }
+  $points = @(Get-WxChatWheelPoints -Win $Win -Cfg $Cfg -SplitX $SplitX)
+  if ($points.Count -eq 0) { throw 'INPUT_TARGET_LOST: 微信聊天区几何范围太窄或窗口尺寸无效' }
+  if ($HistoryCursor -and -not (Test-WxHistoryCursorStable -Expected $HistoryCursor -Actual ([WxGuardedInput]::Cursor()))) {
+    throw 'INPUT_ABORTED: 用户移动鼠标，停止历史滚动'
+  }
+  $cursorBefore = if ($HistoryGuard) { if ($HistoryCursor) { $HistoryCursor } else { [WxGuardedInput]::Cursor() } } else { $null }
+  foreach ($p in $points) {
+    if ($HistoryGuard -and -not (Test-WxHistoryCursorStable -Expected $cursorBefore -Actual ([WxGuardedInput]::Cursor()))) {
+      throw 'INPUT_ABORTED: 用户移动鼠标，停止历史滚动'
+    }
+    if (-not [WxGuardedInput]::OnPoint($Hwnd,[int]$p.x,[int]$p.y)) { continue }
+    try {
+      return (Invoke-TargetWindowWheel -Hwnd $Hwnd -X ([int]$p.x) -Y ([int]$p.y) -Notches $Notches -StepDelayMs $StepDelayMs -ExpectedCursor $(if ($HistoryGuard) { $cursorBefore } else { $null }) -RequireWechat)
+    } catch {
+      if ($_.Exception.Message -match 'INPUT_BUSY|INPUT_ABORTED|已发送 [1-9]\d* 格') { throw }
+      # 仅候选点在前置目标校验阶段失效时继续探测；开始注入后绝不换点重发。
+      if ($_.Exception.Message -notmatch '^INPUT_TARGET_LOST: (滚动点不在目标窗口上|无法定位目标滚动点)') { throw }
+      if ($HistoryGuard -and -not (Test-WxHistoryCursorStable -Expected $cursorBefore -Actual ([WxGuardedInput]::Cursor()))) {
+        throw 'INPUT_ABORTED: 用户移动鼠标，停止历史滚动'
+      }
+    }
+    if ($HistoryGuard -and -not (Test-WxHistoryCursorStable -Expected $cursorBefore -Actual ([WxGuardedInput]::Cursor()))) {
+      throw 'INPUT_ABORTED: 用户移动鼠标，停止历史滚动'
+    }
+  }
+  throw 'INPUT_TARGET_LOST: 微信聊天区所有安全滚轮候选点均不可用'
 }
 
 # 把光标移到"聊天区中心"（滚轮作用于光标下的窗口；左侧 0~42% 是会话列表）
 function Move-WxCursorToChatArea {
   param([Parameter(Mandatory = $true)][IntPtr]$Hwnd, [double]$XFactor = 0.72, [double]$YFactor = 0.55)
-  $r = New-Object WxNative+RECT
-  if (-not [WxNative]::GetWindowRect($Hwnd, [ref]$r)) { return $false }
-  $x = [int]($r.L + ($r.R - $r.L) * $XFactor)
-  $y = [int]($r.T + ($r.B - $r.T) * $YFactor)
+  # 2026-10-29：SetCursorPos 吃物理坐标，所以矩形也要物理值（以前非 100% 缩放会挪到错位置，
+  #   滚轮就发给了别的窗口 → 往期翻页整段失效）。
+  $rp = Get-WxPhysicalRect -Hwnd $Hwnd
+  if ($rp.width -le 0 -or $rp.height -le 0) { return $false }
+  $x = [int]($rp.left + $rp.width * $XFactor)
+  $y = [int]($rp.top + $rp.height * $YFactor)
   return [WxNative]::SetCursorPos($x, $y)
 }
 
@@ -312,33 +1000,42 @@ function Invoke-WxReturnToMain {
   if (-not $r -or -not $r.enabled) { return $false }
   if ($Hwnd -eq [IntPtr]::Zero) { $Hwnd = [WxNative]::FindMain() }
   if ($Hwnd -eq [IntPtr]::Zero) { return $false }
-  $null = Set-WxForeground -Hwnd $Hwnd       # 发键/点击前必须先让微信在前台
+  $null = Set-WxForeground -Hwnd $Hwnd
   Start-Sleep -Milliseconds 250
+  if (-not [WxNative]::ForegroundMatches($Hwnd)) {
+    Write-Host '  [返回] 微信未取得前台，拒绝发送键盘或鼠标输入'
+    return $false
+  }
 
   $action = if ($r.action) { [string]$r.action } else { 'backspace' }
   switch ($action) {
     'backspace' {
+      if (-not [WxNative]::ForegroundMatches($Hwnd)) { return $false }
       [WxInput]::SendKey(0x08)              # VK_BACK
       Start-Sleep -Milliseconds 300
+      if (-not [WxNative]::ForegroundMatches($Hwnd)) { return $false }
       [WxInput]::SendKey(0x08)
     }
     'click' {
       if (-not $r.click) { return $false }
       $info = Get-WxWindowInfo -Hwnd $Hwnd
       if (-not $info) { return $false }
-      $cx = [int]($info.width * [double]$r.click.x)
-      $cy = [int]($info.height * [double]$r.click.y)
-      [WxNative]::Click($cx, $cy)
+      $cx = [int]($info.left + $info.width * [double]$r.click.x)
+      $cy = [int]($info.top + $info.height * [double]$r.click.y)
+      if (-not (Invoke-TargetWindowClick -Hwnd $Hwnd -X $cx -Y $cy -SettleMs 40)) { return $false }
     }
     'clickKey' {
       if (-not $r.click) { return $false }
       $info = Get-WxWindowInfo -Hwnd $Hwnd
       if (-not $info) { return $false }
-      $cx = [int]($info.width * [double]$r.click.x)
-      $cy = [int]($info.height * [double]$r.click.y)
-      [WxNative]::Click($cx, $cy)
+      $cx = [int]($info.left + $info.width * [double]$r.click.x)
+      $cy = [int]($info.top + $info.height * [double]$r.click.y)
+      if (-not (Invoke-TargetWindowClick -Hwnd $Hwnd -X $cx -Y $cy -SettleMs 40)) { return $false }
       Start-Sleep -Milliseconds 350
-      if ($r.key) { [WxInput]::SendKey([int]$r.key) }
+      if ($r.key) {
+        if (-not [WxNative]::ForegroundMatches($Hwnd)) { return $false }
+        [WxInput]::SendKey([int]$r.key)
+      }
     }
     default {
       Write-Host ("  [返回] 未知的 action：{0}" -f $action)
@@ -424,8 +1121,8 @@ function Restore-QqIfMoved {
     $s = ([System.IO.File]::ReadAllText($sp, [System.Text.Encoding]::UTF8) -replace "^\uFEFF", '') | ConvertFrom-Json
     if ($Hwnd -eq [IntPtr]::Zero) {
       # 找 QQ 主窗口（Chrome_WidgetWin_1 + 标题 QQ）
-      $pids = @(Get-Process -Name QQ -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-      foreach ($ln in @([WxNative]::ListTopWindows([UInt32[]]$pids))) {
+      $processIdValues = @(Get-Process -Name QQ -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+      foreach ($ln in @([WxNative]::ListTopWindows([UInt32[]]$processIdValues))) {
         $p = $ln -split '\|'
         if ($p[7] -eq 'Chrome_WidgetWin_1' -and $p[8] -eq 'QQ' -and [int]$p[5] -gt 500) { $Hwnd = [IntPtr][int64]$p[0]; break }
       }
@@ -453,10 +1150,10 @@ function Find-WxWindowAny {
   param([switch]$IncludeHidden)
   $procs = @(Get-Process -Name 'Weixin', 'WeChat' -ErrorAction SilentlyContinue)
   if ($procs.Count -eq 0) { return [IntPtr]::Zero }
-  $pids = @($procs | ForEach-Object { [UInt32]$_.Id })
+  $processIdValues = @($procs | ForEach-Object { [UInt32]$_.Id })
   $best = [IntPtr]::Zero
   $bestArea = 0
-  foreach ($line in [WxNative]::ListTopWindows($pids)) {
+  foreach ($line in [WxNative]::ListTopWindows($processIdValues)) {
     $p = $line -split '\|'
     if ($p[7] -ne 'Qt51514QWindowIcon') { continue }
     if (-not ($p[8] -like '微信*')) { continue }
@@ -486,24 +1183,52 @@ function Minimize-WxWindow {
 # alpha 设为 1/255（用户几乎看不见），此时窗口仍在渲染 → PrintWindow 能抓到；
 # 截完再还原样式并重新最小化。用户全程看不到窗口弹出、焦点也不会被抢。
 function Enter-WxPseudoMinimize {
-  param([Parameter(Mandatory = $true)][IntPtr]$Hwnd)
+  param([Parameter(Mandatory = $true)][IntPtr]$Hwnd, [string]$RestoreState = 'none')
+  if ($Hwnd -eq [IntPtr]::Zero) { throw '无法伪最小化无效窗口句柄' }
+  $rect = [WxNative]::RectOf($Hwnd)
+  if (-not $rect -or $rect.Count -lt 4 -or $rect[2] -le 0 -or $rect[3] -le 0) { throw '无法伪最小化无效窗口句柄' }
   $old = [WxNative]::GetWindowLong($Hwnd, -20)          # GWL_EXSTYLE
-  [void][WxNative]::ShowWindow($Hwnd, 4)                # SW_SHOWNOACTIVATE
-  [void][WxNative]::SetWindowLong($Hwnd, -20, ($old -bor 0x00080000 -bor 0x00000020))  # LAYERED|TRANSPARENT
-  [void][WxNative]::SetLayeredWindowAttributes($Hwnd, 0, 1, 0x2)                        # alpha=1/255
-  return $old
+  $oldKey = [uint32]0; $oldAlpha = [byte]255; $oldFlags = [uint32]0
+  $hadLayerAttrs = [WxNative]::GetLayeredWindowAttributes($Hwnd,[ref]$oldKey,[ref]$oldAlpha,[ref]$oldFlags)
+  $entered = $false
+  try {
+    [void][WxNative]::ShowWindow($Hwnd, 4)                # SW_SHOWNOACTIVATE
+    $pseudoStyle = ($old -bor 0x00080000 -bor 0x00000020)
+    [void][WxNative]::SetWindowLong($Hwnd, -20, $pseudoStyle)
+    if ([WxNative]::GetWindowLong($Hwnd, -20) -ne $pseudoStyle) {
+      throw '设置窗口伪最小化样式失败'
+    }
+    if (-not [WxNative]::SetLayeredWindowAttributes($Hwnd, 0, 1, 0x2)) {
+      throw '设置窗口透明度失败'
+    }
+    $entered = $true
+    return [pscustomobject]@{ oldExStyle = $old; restoreState = $RestoreState; hadLayerAttrs = $hadLayerAttrs; oldColorKey = $oldKey; oldAlpha = $oldAlpha; oldLayerFlags = $oldFlags }
+  } finally {
+    if (-not $entered) {
+      if ($hadLayerAttrs) { [void][WxNative]::SetLayeredWindowAttributes($Hwnd, $oldKey, $oldAlpha, $oldFlags) }
+      else { [void][WxNative]::SetLayeredWindowAttributes($Hwnd, 0, 255, 0x2) }
+      [void][WxNative]::SetWindowLong($Hwnd, -20, $old)
+      switch ($RestoreState) {
+        'minimize' { [void][WxNative]::ShowWindow($Hwnd, 6) }
+        'hide' { [void][WxNative]::ShowWindow($Hwnd, 0) }
+      }
+    }
+  }
 }
 
 function Exit-WxPseudoMinimize {
-  <#
-    .PARAMETER RestoreState  original | minimize | hide
-      original = 采集前是隐藏（收托盘）就还原成隐藏、是最小化就还原成最小化（推荐）
-  #>
-  param([Parameter(Mandatory = $true)][IntPtr]$Hwnd, [int]$OldExStyle, [switch]$MinimizeAgain, [string]$RestoreState = '')
-  [void][WxNative]::SetLayeredWindowAttributes($Hwnd, 0, 255, 0x2)
-  [void][WxNative]::SetWindowLong($Hwnd, -20, $OldExStyle)
+  <# .PARAMETER RestoreState original | minimize | hide #>
+  param([Parameter(Mandatory = $true)][IntPtr]$Hwnd, [int]$OldExStyle, [uint32]$OldColorKey = 0, [byte]$OldAlpha = 255, [uint32]$OldLayerFlags = 0, [switch]$HadLayerAttrs, [switch]$MinimizeAgain, [string]$RestoreState = '')
   $st = $RestoreState
   if (-not $st) { $st = if ($MinimizeAgain) { 'minimize' } else { 'none' } }
+  $okAlpha = if ($HadLayerAttrs) {
+    [WxNative]::SetLayeredWindowAttributes($Hwnd, $OldColorKey, $OldAlpha, $OldLayerFlags)
+  } else {
+    [WxNative]::SetLayeredWindowAttributes($Hwnd, 0, 255, 0x2)
+  }
+  [void][WxNative]::SetWindowLong($Hwnd, -20, $OldExStyle)
+  $styleRestored = ([WxNative]::GetWindowLong($Hwnd, -20) -eq $OldExStyle)
+  if (-not $okAlpha -or -not $styleRestored) { throw '恢复窗口透明度或扩展样式失败' }
   switch ($st) {
     'minimize' { [void][WxNative]::ShowWindow($Hwnd, 6) }   # SW_MINIMIZE
     'hide'     { [void][WxNative]::ShowWindow($Hwnd, 0) }   # SW_HIDE（收托盘）
@@ -516,6 +1241,7 @@ function Get-WxForeground {
 
 function Set-WxForegroundRaw {
   param([Parameter(Mandatory = $true)][IntPtr]$Hwnd)
+  if ($Hwnd -eq [IntPtr]::Zero) { return $false }
   return [WxNative]::SetForegroundWindow($Hwnd)
 }
 
@@ -693,6 +1419,124 @@ function Test-ChatNameMatch {
     }
   }
   return $false
+}
+
+# 强标题身份复核：保留确认过的群号截断和 OCR 容错，但不使用短关键词猜测。
+function Test-ChatHeaderIdentity {
+  param([string]$Actual, [string]$Expected)
+  if ([string]::IsNullOrWhiteSpace($Actual) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
+  $normalize = { param($s)
+    $v = ([string]$s -replace '\s', '') -replace '[（(]\d+[）)]$', ''
+    return ($v -replace '[：:，。、．（）()【】\[\]“”"''·]', '')
+  }
+  $a = & $normalize $Actual; $b = & $normalize $Expected
+  if ($a.Length -ge 2 -and $a -eq $b) { return $true }
+  return [bool](Get-ChatFinalIdentityInfo -Actual $a -Expected $b).same
+}
+
+# 最终聊天标题身份确认：候选匹配仍由 Get-ChatMatchInfo 负责；此处不接受白名单短词。
+# 可容忍：尾部群人数/标点、单字符 OCR 错字；带数字群名的已知稳定前后锚点 OCR 变体；
+# 列表名在长标题前被截断（需长数字群名、至少 8 字共同前缀，且数字段一致）。
+function Get-ChatFinalIdentityInfo {
+  param([string]$Actual, [string]$Expected)
+  $normalize = { param($s)
+    $v = [string]$s
+    $v = $v -replace '\s', ''
+    # 微信标题尾部的群人数不属于身份；如「（官方）（52）」只去掉人数。
+    $v = $v -replace '[（(]\d+[）)]$', ''
+    return ($v -replace '[：:，。、．（）()【】\[\]“”"''·]', '')
+  }
+  $a = & $normalize $Actual
+  $e = & $normalize $Expected
+  if ($a.Length -lt 2 -or $e.Length -lt 2) {
+    return [pscustomobject]@{ same = $false; why = '标题为空或过短' }
+  }
+  if ($a -eq $e) {
+    return [pscustomobject]@{ same = $true; why = '标题规范化后完全相同' }
+  }
+
+  $aNums = @([regex]::Matches($a, '\d+') | ForEach-Object { $_.Value })
+  $eNums = @([regex]::Matches($e, '\d+') | ForEach-Object { $_.Value })
+  $hasDigits = ($aNums.Count -gt 0 -or $eNums.Count -gt 0)
+  $sameNumbers = ($aNums.Count -eq $eNums.Count)
+  if ($sameNumbers) {
+    for ($i = 0; $i -lt $aNums.Count; $i++) {
+      if ($aNums[$i] -ne $eNums[$i]) { $sameNumbers = $false; break }
+    }
+  }
+  # 群号相等为强身份依据；尾部号仅在短的号码为长号码前缀且至少 3 位时容忍 OCR 截断。
+  $lastNumberTruncated = $false
+  if ($aNums.Count -eq $eNums.Count -and $aNums.Count -gt 0 -and -not $sameNumbers) {
+    $lastNumberTruncated = $true
+    for ($li = 0; $li -lt ($aNums.Count - 1); $li++) {
+      if ($aNums[$li] -ne $eNums[$li]) { $lastNumberTruncated = $false; break }
+    }
+    if ($lastNumberTruncated) {
+      $shortId = if ($aNums[-1].Length -le $eNums[-1].Length) { $aNums[-1] } else { $eNums[-1] }
+      $longId = if ($aNums[-1].Length -gt $eNums[-1].Length) { $aNums[-1] } else { $eNums[-1] }
+      $lastNumberTruncated = ($shortId.Length -ge 3 -and $longId.StartsWith($shortId))
+    }
+  }
+  if ($aNums.Count -gt 0 -and $eNums.Count -gt 0 -and $aNums[0] -ne $eNums[0]) {
+    return [pscustomobject]@{ same = $false; why = '标题主数字标识不同' }
+  }
+  $extraIdSuffix = ($aNums.Count -lt $eNums.Count -and $aNums.Count -gt 0)
+  if ($aNums.Count -eq $eNums.Count -and -not $sameNumbers -and -not $lastNumberTruncated) {
+    return [pscustomobject]@{ same = $false; why = '标题数字标识不同' }
+  }
+
+  # 受限的 OCR 变体：两边长度相近，名称至少 6 字，只差 1 次编辑。
+  # 含数字标题要求数字段相同，或末尾长群号确实被 OCR 截短。
+  $nearDigitsCompatible = (-not $hasDigits -or $sameNumbers -or $lastNumberTruncated)
+  if ($a.Length -ge 6 -and $e.Length -ge 6 -and [Math]::Abs($a.Length - $e.Length) -le 1 -and
+      (Get-ChatLevenshtein $a $e) -le 1 -and $nearDigitsCompatible -and -not ($aNums.Count -lt $eNums.Count -and $aNums.Count -gt 0)) {
+    return [pscustomobject]@{ same = $true; why = '标题仅有一个受限 OCR 字符差异' }
+  }
+
+  # 已知 OCR 形态：群名数字段相同、开头稳定且末尾仍保留至少两字锚点，
+  # 中间出现少量字形误识别（如「26人工2毋形及群」vs「26人工2班<OCR 错字示例>」）。
+  if ($sameNumbers -and $aNums.Count -gt 0 -and [Math]::Abs($a.Length - $e.Length) -le 2 -and -not ($aNums.Count -lt $eNums.Count -and $aNums.Count -gt 0)) {
+    $prefix = 0
+    $prefixLimit = [Math]::Min($a.Length, $e.Length)
+    while ($prefix -lt $prefixLimit -and $a[$prefix] -eq $e[$prefix]) { $prefix++ }
+    $suffix = 0
+    while ($suffix -lt $prefixLimit -and $a[$a.Length - 1 - $suffix] -eq $e[$e.Length - 1 - $suffix]) { $suffix++ }
+    if ($prefix -ge 5 -and $suffix -ge 2 -and (Get-ChatLevenshtein $a $e) -le 3) {
+      return [pscustomobject]@{ same = $true; why = '数字标识及标题前后锚点一致（受限 OCR 变体）' }
+    }
+  }
+
+  # 受限群名截断：要求群名前缀相同。若短标题本身已有长数字群号，则允许仅截掉身份文字尾缀；
+  # 若短标题的号码只读出前缀，则必须以数字结尾并满足号码字段前缀一致，语义名称不能代替群号。
+  $short = $null; $long = $null; $shortNums = @(); $longNums = @()
+  if ($a.Length -lt $e.Length) { $short = $a; $long = $e; $shortNums = $aNums; $longNums = $eNums }
+  elseif ($e.Length -lt $a.Length) { $short = $e; $long = $a; $shortNums = $eNums; $longNums = $aNums }
+  if ($null -ne $short -and $short.Length -ge 8 -and $shortNums.Count -gt 0 -and $longNums.Count -ge $shortNums.Count) {
+    $numbersPrefix = $true
+    for ($i = 0; $i -lt $shortNums.Count; $i++) {
+      if ($i -lt ($shortNums.Count - 1)) {
+        if ($shortNums[$i] -ne $longNums[$i]) { $numbersPrefix = $false; break }
+      } elseif ($shortNums[$i] -ne $longNums[$i] -and -not ($shortNums[$i].Length -ge 3 -and $longNums[$i].StartsWith($shortNums[$i]))) {
+        $numbersPrefix = $false; break
+      }
+    }
+    if ($numbersPrefix) {
+      $common = 0
+      while ($common -lt $short.Length -and $short[$common] -eq $long[$common]) { $common++ }
+      $suffixIsSameTruncation = ($common -eq $short.Length -and $short.Length -lt $long.Length)
+      $numSuffixTruncated = ($shortNums.Count -lt $longNums.Count) -or ($shortNums.Count -eq $longNums.Count -and $shortNums.Count -gt 0 -and $shortNums[-1].Length -lt $longNums[-1].Length)
+      $mainNumberMatches = ($shortNums.Count -gt 0 -and $longNums.Count -gt 0 -and $shortNums[0] -eq $longNums[0])
+      $shortEndLooksLikeId = ($short -match '\d$')
+      $shortHasLongId = ($shortNums.Count -gt 0 -and $shortNums[-1].Length -ge 5)
+      $shortHasNumericPrefix = ($shortEndLooksLikeId -and $numSuffixTruncated)
+      $suffixAllowed = ($shortHasLongId -or $shortHasNumericPrefix)
+      if ($suffixIsSameTruncation -and $suffixAllowed -and $mainNumberMatches) {
+        return [pscustomobject]@{ same = $true; why = '长数字群标题与列表截断名的数字段/前缀一致' }
+      }
+    }
+  }
+
+  return [pscustomobject]@{ same = $false; why = '最终标题身份不匹配（不以白名单短词确认）' }
 }
 
 # ==================== 两个名字是不是同一个群（2026-10-27）====================
@@ -913,20 +1757,19 @@ function Get-ChatAnchorRecords {
 }
 
 function Test-ChatAnchorHit {
-  param([string[]]$Lines, [string[]]$Anchors)
-  if ($null -eq $Anchors -or $Anchors.Count -eq 0) { return $false }
-  if ($null -eq $Lines -or $Lines.Count -eq 0) { return $false }
+  param([string[]]$Lines, [string[]]$Anchors, [int]$MinimumHits = 1)
+  if ($null -eq $Anchors -or $Anchors.Count -eq 0 -or $null -eq $Lines -or $Lines.Count -eq 0) { return $false }
+  $matched = @{}
   foreach ($l in $Lines) {
     $n = ($l -replace '\s', '')
     if ([string]::IsNullOrWhiteSpace($n)) { continue }
     foreach ($a in $Anchors) {
-      if ([string]::IsNullOrWhiteSpace($a)) { continue }
-      if ($n -eq $a) { return $true }
-      # OCR 对同一行偶有 1~2 字差异 → 长锚点再用"包含"兜一层（短锚点不用，避免误命中）
-      if ($a.Length -ge 8 -and ($n.Contains($a) -or $a.Contains($n))) { return $true }
+      $aa = ([string]$a -replace '\s', '')
+      if ([string]::IsNullOrWhiteSpace($aa) -or $matched.ContainsKey($aa)) { continue }
+      if ($n -eq $aa -or ($aa.Length -ge 8 -and $n.Length -ge 8 -and ($n.Contains($aa) -or $aa.Contains($n)))) { $matched[$aa] = $true; break }
     }
   }
-  return $false
+  return ($matched.Count -ge [Math]::Max(1, $MinimumHits))
 }
 
 # ==================== 时间锚点（2026-10-27）====================
@@ -1061,20 +1904,36 @@ function Get-ChatTimesFromLines {
 }
 
 function Save-ChatAnchors {
-  param([string]$AnchorFile, [string]$Key, [object[]]$Lines, [int]$Take = 3, [string]$ConsolidateFuzzy = '', [string[]]$ConsolidateWhitelist = @(), [object]$Time = $null)   # ⚠️ 必须是 object[]：声明成 [string[]] 时 PowerShell 会在进函数前把 OCR 行对象转成字符串
+  param([string]$AnchorFile, [string]$Key, [object[]]$Lines, [int]$Take = 3, [string]$ConsolidateFuzzy = '', [string[]]$ConsolidateWhitelist = @(), [object]$Time = $null, [object[]]$Records = @())   # ⚠️ 必须是 object[]：声明成 [string[]] 时 PowerShell 会在进函数前把 OCR 行对象转成字符串
   if ([string]::IsNullOrWhiteSpace($Key)) { return }
   # 2026-10-19 修：QQ 的 .lines 是 OCR 行**对象**（@{text=…;x=…}），不是字符串 ——
   #   上一版直接把对象塞进来，锚点存成了 "@{text=26新闻郄怙;x=452;…}"，永远匹配不上。
   #   这里统一取 .text（字符串就直接用）。
-  $norm = @($Lines | ForEach-Object {
-      $v = $_
+  $norm = @()
+  if ($Records -and $Records.Count -gt 0) {
+    foreach ($rec in $Records) {
+      if ($null -eq $rec -or -not $rec.PSObject.Properties['line']) { continue }
+      $t = ([string]$rec.line) -replace '\s', ''
+      if ([string]::IsNullOrWhiteSpace($t)) { continue }
+      $rt = ConvertTo-ChatAnchorTimeText -Value $rec.time
+      $norm += [pscustomobject]@{ line = $t; time = $rt }
+    }
+  } else {
+    foreach ($v0 in @($Lines)) {
+      $v = $v0
       if ($null -ne $v -and $v -isnot [string]) {
         if ($v.PSObject.Properties['text']) { $v = [string]$v.text } else { $v = [string]$v }
       }
-      if ($null -eq $v) { return }
+      if ($null -eq $v) { continue }
       $t = ([string]$v) -replace '\s', ''
-      if (-not [string]::IsNullOrWhiteSpace($t)) { $t }
-    })
+      if (-not [string]::IsNullOrWhiteSpace($t)) { $norm += [pscustomobject]@{ line = $t; time = (ConvertTo-ChatAnchorTimeText -Value $Time) } }
+    }
+  }
+  if ($norm.Count -eq 0) { return }
+  # Records 调用方已经排除了标题/公告元信息；旧调用保留短行锚点兼容。
+  if ($Records -and $Records.Count -gt 0) {
+    $norm = @($norm | Where-Object { $_.line.Length -ge 6 -and $_.line -notmatch '^(群聊成员|群成员|群公告|公告)$' })
+  }
   if ($norm.Count -eq 0) { return }
   $n = [Math]::Min($Take, $norm.Count)
   $first = @($norm[0..($n - 1)])
@@ -1098,14 +1957,13 @@ function Save-ChatAnchors {
       $keep += $ln
     }
   }
-  # 2026-10-27：锚点 = 文本 + 时间。给了 -Time 就写 3 列（key<TAB>ISO时间<TAB>行），
-  #   没给（或给的时间解析不了）就保持旧的 2 列 —— 读方两种都兼容（Get-ChatAnchorRecords）。
-  $timeStr = ''
-  $td = ConvertTo-ChatAnchorTimeText -Value $Time
-  if ($td) { $timeStr = $td.ToString('o') }
+  # 2026-10-27：锚点 = 文本 + 时间。Records 模式按每行自身时间写，旧调用保留 -Time 行为。
   foreach ($a in $first) {
-    if ($timeStr) { $keep += ($Key + [char]9 + $timeStr + [char]9 + $a) }
-    else { $keep += ($Key + [char]9 + $a) }
+    $timeStr = ''
+    $td = if ($a.PSObject.Properties['time']) { ConvertTo-ChatAnchorTimeText -Value $a.time } else { ConvertTo-ChatAnchorTimeText -Value $Time }
+    if ($td) { $timeStr = $td.ToString('o') }
+    if ($timeStr) { $keep += ($Key + [char]9 + $timeStr + [char]9 + $a.line) }
+    else { $keep += ($Key + [char]9 + $a.line) }
   }
   $dir = Split-Path -Parent $AnchorFile
   if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
@@ -1142,4 +2000,196 @@ function Get-ChatStableKey {
   }
   if ($best) { return $best }
   return $n
+}
+
+# ==================== 布局档案（微信 / QQ 共用，2026-10-29）====================
+# 为什么要有这一层（外部 125%/150% 实测暴露的根本问题）：
+#   原来所有区域边界都是"窗口宽/高的百分比"（sessionXTo=0.42、headerYTo=0.16…），
+#   等于假设"UI 随窗口等比缩放"。但微信/QQ 的真实布局是
+#     · 左侧会话列表 ≈ 固定像素宽（不随窗口变宽而变宽）
+#     · 右侧聊天面板 = 吃掉剩下的弹性宽度
+#     · 顶部标题条 ≈ 固定像素高
+#   所以窗口一变宽，"列表宽 ÷ 窗口宽"就变小，0.42 那条线就切进聊天面板里 ——
+#   实测：125% 时群名在 x=404、分界线 468；150% 时群名在 x=486、分界线 563，
+#   分界线永远在群名右边，群名永远被切掉（于是"一个群都点不开"）。
+# 这里的做法不是"再标定一次"，而是给比例加**像素上下限（按窗口 DPI 折算）**：
+#   在标定过的窗口尺寸下数值完全不变（零回归），窗口异常宽/异常矮时兜住。
+function Get-WxDpiFactorOf($Win) {
+  if ($null -eq $Win) { return 1.0 }
+  if ($Win.PSObject.Properties['dpi'] -and [int]$Win.dpi -gt 0) { return ([double]$Win.dpi / 96.0) }
+  return 1.0
+}
+
+# 布局档案文件：部署时（安装器或 -Calibrate）实测一次，写成 key=value 文本。
+# ⚠️ 刻意不用 JSON：本项目铁律是"JSON 只用 Node 写"，而这个文件要在 PS 安装器里生成，
+#   用 key=value 就绕开了 BOM/单元素数组压平那一整类坑。
+function Get-WxLayoutProfilePath { return (Join-Path $PSScriptRoot 'layout-profile.txt') }
+function Get-QqLayoutProfilePath { return (Join-Path $PSScriptRoot 'layout-profile-qq.txt') }
+
+function Read-LayoutProfileFile([string]$Path) {
+  $h = @{}
+  if (Test-Path -LiteralPath $Path) {
+    try {
+      foreach ($ln in @(Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        if ([string]::IsNullOrWhiteSpace($ln) -or $ln -match '^\s*#') { continue }
+        if ($ln -match '^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$') { $h[$matches[1]] = $matches[2] }
+      }
+    } catch { $h = @{} }
+  }
+  return $h
+}
+
+# 档案路径可被环境变量覆盖，两个用处：
+#   · 回归测试：设成 none → 完全按比例（结果与本机标定无关，fixture 才稳定）；
+#   · 排障：临时指向另一份档案，对比两种布局模型。
+function Resolve-LayoutProfilePath([string]$Default, [string]$EnvName) {
+  $v = [Environment]::GetEnvironmentVariable($EnvName)
+  if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
+  if ($v -eq 'none') { return '' }
+  return $v
+}
+
+function Read-WxLayoutProfile {
+  if ($null -ne $script:WxLayoutProfileCache) { return $script:WxLayoutProfileCache }
+  $p = Resolve-LayoutProfilePath -Default (Get-WxLayoutProfilePath) -EnvName 'WX_LAYOUT_PROFILE'
+  $script:WxLayoutProfileCache = if ($p) { Read-LayoutProfileFile -Path $p } else { @{} }
+  return $script:WxLayoutProfileCache
+}
+
+function Read-QqLayoutProfile {
+  if ($null -ne $script:QqLayoutProfileCache) { return $script:QqLayoutProfileCache }
+  $p = Resolve-LayoutProfilePath -Default (Get-QqLayoutProfilePath) -EnvName 'WX_LAYOUT_PROFILE_QQ'
+  $script:QqLayoutProfileCache = if ($p) { Read-LayoutProfileFile -Path $p } else { @{} }
+  return $script:QqLayoutProfileCache
+}
+
+function Get-WxLayoutProfile {
+  <#
+    .SYNOPSIS  把"比例"换算成"像素"，并套上按 DPI 折算的上下限
+    .OUTPUTS   含 splitX / titleY / nameXMin / listCapPx / dpiFactor 等字段
+  #>
+  param($Win, $Cfg, [string]$ProfilePath = '')
+  $f = Get-WxDpiFactorOf $Win
+  $lay = $null
+  if ($Cfg -and $Cfg.PSObject.Properties['layout']) { $lay = $Cfg.layout }
+  $listCapPx = 420; if ($lay -and $lay.PSObject.Properties['listCapPx']) { $listCapPx = [int]$lay.listCapPx }
+  $titlePx = 96; if ($lay -and $lay.PSObject.Properties['titleStripPx']) { $titlePx = [int]$lay.titleStripPx }
+  $listFloorPx = 180; if ($lay -and $lay.PSObject.Properties['listFloorPx']) { $listFloorPx = [int]$lay.listFloorPx }
+
+  $ratioSplit = [int]($Win.width * [double]$Cfg.sessionXTo)
+  $split = [Math]::Min($ratioSplit, [int]($listCapPx * $f))
+  $floor = [int]($listFloorPx * $f)
+  if ($split -lt $floor) { $split = [Math]::Min($ratioSplit, [int]($Win.width * 0.5)) }
+
+  # 有布局档案就用档案里的「列表宽度（96DPI 像素常数）」× 当前 DPI 系数 ——
+  #   这才是符合真实布局的模型：列表宽度是固定像素，不随窗口变宽而变。
+  #   实测：125% 量到 403 → 403/1.25=322；150% 量到 480 → 480/1.5=320，两个缩放互相印证。
+  $prof = if ($ProfilePath) { Read-LayoutProfileFile -Path $ProfilePath } else { Read-WxLayoutProfile }
+  $splitSource = 'ratio'
+  if ($prof.ContainsKey('listWidthPx')) {
+    $lw = 0
+    if ([int]::TryParse($prof['listWidthPx'], [ref]$lw) -and $lw -gt 0) {
+      $split = [int]($lw * $f)
+      $splitSource = 'profile'
+      if ($split -gt [int]($Win.width * 0.55)) { $split = [int]($Win.width * 0.55) }
+      if ($split -lt [int]($Win.width * 0.20)) { $split = [int]($Win.width * 0.20) }
+    }
+  }
+  if ($prof.ContainsKey('listCapPx')) { $v = 0; if ([int]::TryParse($prof['listCapPx'], [ref]$v) -and $v -gt 0) { $listCapPx = $v } }
+  if ($prof.ContainsKey('titleStripPx')) { $v = 0; if ([int]::TryParse($prof['titleStripPx'], [ref]$v) -and $v -gt 0) { $titlePx = $v } }
+
+  $ratioTitle = [int]($Win.height * [double]$Cfg.headerYTo)
+  $titleY = [Math]::Max($ratioTitle, [int]($titlePx * $f))
+  if ($titleY -gt [int]($Win.height * 0.5)) { $titleY = [int]($Win.height * 0.5) }
+
+  $nameX = 0
+  if ($Cfg.PSObject.Properties['nameXFrom'] -and $Cfg.nameXFrom) { $nameX = [int]($Win.width * [double]$Cfg.nameXFrom) }
+
+  return [pscustomobject]@{
+    dpiFactor   = $f
+    splitX      = $split            # 会话列表 / 聊天面板 的默认分界（内容自锚定会再往前收）
+    splitCap    = [int]($listCapPx * $f)
+    splitSource = $splitSource      # 'profile'（已标定）或 'ratio'（还没标定过）
+    titleY      = $titleY           # 标题条下沿
+    nameXMin    = $nameX            # 名字列起点（比例；调用方可改用数据自校准）
+    listCapPx   = $listCapPx
+    titleStripPx = $titlePx
+  }
+}
+
+function Get-WxNameXMinFromRows {
+  <#
+    .SYNOPSIS  从会话行的 x 分布推断"未读角标列 / 名字列"的分界（数据驱动）
+    .DESCRIPTION
+      角标（未读气泡里的 1/17/0）在名字列**左边**，判错就会把真名叫 "212" 的会话当角标丢掉。
+      实测比例 0.145 在 150%（窗口 1341）算成 194，而名字列实际在 188 → 真名 212 被误删。
+      这里改成找"第一处明显空隙"（角标簇与名字簇之间的空档），不再依赖窗口宽度比例。
+  #>
+  param([object[]]$SessionLines, [double]$WinW, $Cfg)
+  $fallback = 0
+  if ($Cfg -and $Cfg.PSObject.Properties['nameXFrom'] -and $Cfg.nameXFrom) { $fallback = [int]($WinW * [double]$Cfg.nameXFrom) }
+  $xs = @($SessionLines | Where-Object { $_ } | ForEach-Object { [int]$_.x } | Sort-Object -Unique)
+  $hi = [int]($WinW * 0.30)
+  $xs = @($xs | Where-Object { $_ -ge 0 -and $_ -le $hi })
+  if ($xs.Count -lt 2) { return $fallback }
+  for ($i = 1; $i -lt $xs.Count; $i++) {
+    if (($xs[$i] - $xs[$i - 1]) -ge 20) { return [int](($xs[$i] + $xs[$i - 1]) / 2) }
+  }
+  return $fallback
+}
+
+function Get-WxSplitCandidates {
+  <#
+    .SYNOPSIS  失败自搜索用的候选分界线（由可信到激进）
+    .DESCRIPTION
+      校验失败（点开读不到本意群）时，按这个顺序换分界线重试 —— 让"布局变了"能自愈，
+      而不是等人来改配置。第 1 个是内容自锚定的结果，最后是比例兜底。
+  #>
+  param($Win, $Cfg, [int]$ContentSplit = 0)
+  $out = @()
+  if ($ContentSplit -gt 0) { $out += [int]$ContentSplit }
+  $prof = Get-WxLayoutProfile -Win $Win -Cfg $Cfg
+  foreach ($v in @($prof.splitX, [int]($prof.splitX * 0.9), [int]($prof.splitX * 0.8), [int]($prof.splitX * 1.1))) {
+    if ($v -gt 0 -and $out -notcontains $v) { $out += [int]$v }
+  }
+  return $out
+}
+
+function Get-QqLayoutProfile {
+  <#
+    .SYNOPSIS  QQ 窗口的布局档案（与微信同一套思路：像素常数 × DPI 系数，比例只做兜底）
+    .DESCRIPTION
+      QQ 原来也是 chatXFrom=0.3 / listYFrom=0.15 这种"窗口比例"假设，同样是错的模型：
+      左侧列表是近似固定像素宽，窗口一拉宽，0.3W 就切进聊天区。
+      档案由 `采集器-QQ.ps1 -Calibrate` 生成；没有档案时退回比例（行为与以前完全一致）。
+  #>
+  param($Win, $Cfg, [string]$ProfilePath = '')
+  $f = Get-WxDpiFactorOf $Win
+  $prof = if ($ProfilePath) { Read-LayoutProfileFile -Path $ProfilePath } else { Read-QqLayoutProfile }
+  $chatX = [int]($Win.width * [double]$Cfg.chatXFrom)
+  $chatSrc = 'ratio'
+  if ($prof.ContainsKey('listWidthPx')) {
+    $v = 0
+    if ([int]::TryParse($prof['listWidthPx'], [ref]$v) -and $v -gt 0) {
+      $chatX = [int]($v * $f); $chatSrc = 'profile'
+      if ($chatX -gt [int]($Win.width * 0.60)) { $chatX = [int]($Win.width * 0.60) }
+      if ($chatX -lt [int]($Win.width * 0.15)) { $chatX = [int]($Win.width * 0.15) }
+    }
+  }
+  $listY = [int]($Win.height * [double]$Cfg.listYFrom)
+  if ($prof.ContainsKey('listTopPx')) {
+    $v = 0
+    if ([int]::TryParse($prof['listTopPx'], [ref]$v) -and $v -gt 0) { $listY = [int]($v * $f) }
+  }
+  $titlePx = 110
+  if ($prof.ContainsKey('titleStripPx')) { $v = 0; if ([int]::TryParse($prof['titleStripPx'], [ref]$v) -and $v -gt 0) { $titlePx = $v } }
+  $headerY = [Math]::Max([int]($Win.height * 0.25), [int]($titlePx * $f))
+  if ($headerY -gt [int]($Win.height * 0.45)) { $headerY = [int]($Win.height * 0.45) }
+  return [pscustomobject]@{
+    dpiFactor = $f
+    chatX     = $chatX        # 聊天区左边界（= 列表右边界）
+    chatSrc   = $chatSrc
+    listY     = $listY        # 会话列表上边界（跳过顶部搜索栏/标签栏）
+    headerY   = $headerY      # 聊天头部（群名）纵向范围
+  }
 }
